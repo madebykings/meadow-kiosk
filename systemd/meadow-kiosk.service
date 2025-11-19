@@ -1,1 +1,15 @@
+[Unit]
+Description=Meadow Kiosk Service
+After=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/meadow-kiosk
+ExecStart=/usr/bin/python3 /home/pi/meadow-kiosk/kiosk.py
+Restart=always
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
 
