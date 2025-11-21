@@ -1,3 +1,5 @@
+cd ~/meadow-kiosk
+cat > kiosk.py << 'EOF'
 #!/usr/bin/env python3
 import os
 import sys
@@ -14,7 +16,7 @@ from wordpress import next_command, ack_command, heartbeat, set_screen_mode
 KIOSK_URL_FILE = "/home/meadow/kiosk.url"
 
 # PIR settings
-PIR_PIN = 17         # Your chosen PIR pin (BCM)
+PIR_PIN = 22         # Your chosen PIR pin (BCM)
 ADS_IDLE_SECONDS = 30
 HEARTBEAT_SECONDS = 60
 COMMAND_POLL_SECONDS = 2
@@ -132,9 +134,9 @@ def main():
 
     setup_gpio()
 
-    # IMEI removed (not used in this build)
+    # IMEI not used in this build
     imei = None
-    print("IMEI: None", flush=True)
+    print("IMEI:", imei, flush=True)
 
     cfg = get_config(imei=imei)
     print(f"Config loaded for kiosk {cfg.get('kiosk_id')}", flush=True)
@@ -143,6 +145,8 @@ def main():
 
     motors_map = cfg.get("motors", {})
     spin_times = cfg.get("spin_time", {})
+    if not motors_map:
+        print("[BOOT] WARNING: no motors configured in config", flush=True)
 
     setup_motors(motors_map)
     GPIO.setup(PIR_PIN, GPIO.IN)
@@ -178,3 +182,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+EOF
