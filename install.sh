@@ -19,7 +19,7 @@ sudo apt install -y \
     unclutter
 
 echo "=== Installing Python modules ==="
-pip3 install --break-system-packages requests pyserial RPi.GPIO
+pip3 install --break-system-packages requests pyserial
 
 echo "=== Enabling UART for SIM7600 ==="
 sudo raspi-config nonint do_serial 2
