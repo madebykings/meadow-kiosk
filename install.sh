@@ -29,7 +29,7 @@ mkdir -p ~/.config/lxsession/LXDE-pi
 
 cat <<'EOF' > /home/meadow/kiosk-browser.sh
 #!/bin/bash
-URL_FILE="/boot/kiosk.url"
+URL_FILE="/home/meadow/kiosk.url"
 while [ ! -s "$URL_FILE" ]; do
   sleep 1
 done
