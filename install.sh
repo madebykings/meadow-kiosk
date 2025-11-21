@@ -10,7 +10,7 @@ sudo apt install -y \
     git \
     python3-pip \
     python3-serial \
-    python3-rpi.gpio \
+    python3-rpi-lgpio \
     chromium \
     modemmanager \
     network-manager \
