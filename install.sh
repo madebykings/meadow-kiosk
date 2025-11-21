@@ -38,7 +38,7 @@ URL=$(tr -d '\r\n' < "$URL_FILE")
 chromium-browser --noerrdialogs --disable-infobars --kiosk "$URL"
 EOF
 
-chmod +x /home/pi/kiosk-browser.sh
+chmod +x /home/meadow/kiosk-browser.sh
 
 cat <<'EOF' > ~/.config/lxsession/LXDE-pi/autostart
 @unclutter
