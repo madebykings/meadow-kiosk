@@ -108,17 +108,15 @@ def main():
 
             # --- PIR / screen-mode logic (only if PIR configured and NOT vending) ---
             if pir_pin > 0 and not in_vend:
-                # Debounced read: majority of 5 samples to filter jitter
-                samples = [GPIO.input(pir_pin) for _ in range(5)]
-                pir_state = 1 if samples.count(1) >= 3 else 0
+                pir_state = GPIO.input(pir_pin)
 
-                # Motion detected (stable)
+                # Motion detected
                 if pir_state == 1:
                     last_motion = now
                     screen_on()
                     if current_mode in ("ads", "browse") and current_mode != "browse":
                         current_mode = "browse"
-                        print("[PIR] Motion -> browse (debounced)", flush=True)
+                        print("[PIR] Motion -> browse", flush=True)
                         set_screen_mode(cfg, current_mode)
 
                 idle_for = now - last_motion
