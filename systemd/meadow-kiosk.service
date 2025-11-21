@@ -1,6 +1,7 @@
 [Unit]
 Description=Meadow Kiosk Service
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -8,6 +9,7 @@ User=meadow
 WorkingDirectory=/home/meadow/meadow-kiosk
 ExecStart=/usr/bin/python3 /home/meadow/meadow-kiosk/kiosk.py
 Restart=always
+RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
