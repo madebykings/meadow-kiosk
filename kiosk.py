@@ -7,7 +7,6 @@ import threading
 import RPi.GPIO as GPIO
 
 from config_remote import get_config
-from modem import get_modem_imei
 from motors import setup_motors, spin_motor
 from wordpress import next_command, ack_command, heartbeat, set_screen_mode
 
