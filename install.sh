@@ -45,7 +45,7 @@ cat <<'EOF' > ~/.config/lxsession/LXDE-pi/autostart
 @xset s off
 @xset -dpms
 @xset s noblank
-@/home/pi/kiosk-browser.sh
+@/home/meadow/kiosk-browser.sh
 EOF
 
 echo "=== Installing systemd service ==="
