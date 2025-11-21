@@ -3,7 +3,7 @@ import os
 import requests
 
 PROVISION_PATH = "/boot/provision.json"
-CACHE_PATH = "/boot/kiosk.config.cache.json"
+CACHE_PATH = "/home/meadow/kiosk.config.cache.json"
 
 
 def load_provision():
