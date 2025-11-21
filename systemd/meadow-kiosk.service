@@ -4,8 +4,8 @@ After=network-online.target
 
 [Service]
 User=pi
-WorkingDirectory=/home/pi/meadow-kiosk
-ExecStart=/usr/bin/python3 /home/pi/meadow-kiosk/kiosk.py
+WorkingDirectory=/home/meadow/meadow-kiosk
+ExecStart=/usr/bin/python3 /home/meadow/meadow-kiosk/kiosk.py
 Restart=always
 StandardOutput=journal
 StandardError=journal
