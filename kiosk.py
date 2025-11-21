@@ -18,7 +18,7 @@ ADS_TIMEOUT = 30
 IDLE_TIMEOUT = 300
 
 # Where we'll store the kiosk URL for the browser launcher
-KIOSK_URL_FILE = "/boot/kiosk.url"
+KIOSK_URL_FILE = "/home/meadow/kiosk.url"
 
 
 def screen_on():
