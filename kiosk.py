@@ -14,7 +14,7 @@ from wordpress import next_command, ack_command, heartbeat, set_screen_mode
 KIOSK_URL_FILE = "/home/meadow/kiosk.url"
 
 # PIR settings
-PIR_PIN = 22         # Your chosen PIR pin (BCM)
+PIR_PIN = 17         # Your chosen PIR pin (BCM)
 ADS_IDLE_SECONDS = 30
 HEARTBEAT_SECONDS = 60
 COMMAND_POLL_SECONDS = 2
