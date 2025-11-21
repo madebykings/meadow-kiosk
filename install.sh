@@ -11,7 +11,7 @@ sudo apt install -y \
     python3-pip \
     python3-serial \
     python3-rpi.gpio \
-    chromium-browser \
+    chromium \
     modemmanager \
     network-manager \
     usb-modeswitch \
@@ -27,7 +27,7 @@ sudo raspi-config nonint do_serial 2
 echo "=== Creating Chromium kiosk autostart (dynamic URL from WP) ==="
 mkdir -p ~/.config/lxsession/LXDE-pi
 
-cat <<'EOF' > /home/pi/kiosk-browser.sh
+cat <<'EOF' > /home/meadow/kiosk-browser.sh
 #!/bin/bash
 URL_FILE="/boot/kiosk.url"
 while [ ! -s "$URL_FILE" ]; do
@@ -35,7 +35,7 @@ while [ ! -s "$URL_FILE" ]; do
 done
 URL=$(tr -d '\r\n' < "$URL_FILE")
 [ -z "$URL" ] && URL="https://google.com"
-chromium-browser --noerrdialogs --disable-infobars --kiosk "$URL"
+chromium --noerrdialogs --disable-infobars --kiosk "$URL"
 EOF
 
 chmod +x /home/meadow/kiosk-browser.sh
