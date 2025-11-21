@@ -5,8 +5,7 @@ import time
 def api_base(cfg):
     """
     Build the base API URL from the kiosk config.
-    Example domain in config:
-      "domain": "https://greiga65.sg-host.com/"
+    Example: "https://domain.com/wp-json/meadow/v1"
     """
     return cfg["domain"].rstrip("/") + "/wp-json/meadow/v1"
 
@@ -15,15 +14,16 @@ def next_command(cfg):
     """
     Ask WP if there is a vend command for this kiosk.
 
-    Original expected response (single object):
-      {"id": 123, "motor": 2}
-
-    Now also supports WP returning:
-      [ {"id": 123, "motor": 2}, ... ]  (a list/queue of commands)
-      {} or [] or None meaning "no command".
+    Supports:
+      - {"id": 123, "motor": 2}
+      - [{"id": 123, "motor": 2}, ...]
+      - {} or [] or None for no commands
     """
     url = api_base(cfg) + "/next-command"
-    params = {"kiosk_id": cfg["kiosk_id"], "key": cfg["api_key"]}
+    params = {
+        "kiosk_id": cfg["kiosk_id"],
+        "key": cfg["api_key"],
+    }
 
     try:
         r = requests.get(url, params=params, timeout=5)
@@ -31,41 +31,34 @@ def next_command(cfg):
         print("next_command: request failed:", e)
         return None
 
-    if r.status_code != 200:
-        print("next_command: non-200 status:", r.status_code)
-        return None
-
     try:
         data = r.json()
     except ValueError:
-        print("next_command: response not JSON")
+        print("next_command: response not JSON:", r.text)
         return None
 
     print("next_command raw:", data)
 
-    # --- Handle list response from WP ---
+    # If WP returns a list, take the first command
     if isinstance(data, list):
         if not data:
-            # Empty list = no commands
             return None
-        # Take the first command as "next"
         data = data[0]
 
-    # --- Must be a dict now ---
+    # If still not a dict, ignore
     if not isinstance(data, dict):
         print("next_command: unexpected data type:", type(data))
         return None
 
-    # --- Must contain a motor key ---
     motor = data.get("motor")
     if not motor:
         return None
 
-    # Normalise/convert motor to int
+    # Convert motor to int
     try:
         data["motor"] = int(motor)
-    except (TypeError, ValueError):
-        print("next_command: invalid motor value:", motor)
+    except:
+        print("next_command: invalid motor:", motor)
         return None
 
     return data
@@ -85,7 +78,7 @@ def ack_command(cfg, cmd_id, success=True):
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print("ack_command: request failed:", e)
+        print("ack_command: error:", e)
 
 
 def heartbeat(cfg, imei=None):
@@ -100,10 +93,11 @@ def heartbeat(cfg, imei=None):
     }
     if imei:
         payload["imei"] = imei
+
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print("heartbeat: request failed:", e)
+        print("heartbeat: error:", e)
 
 
 def set_screen_mode(cfg, mode, order_id=None):
@@ -118,7 +112,8 @@ def set_screen_mode(cfg, mode, order_id=None):
     }
     if order_id is not None:
         payload["order_id"] = int(order_id)
+
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print("set_screen_mode: request failed:", e)
+        print("set_screen_mode: error:", e)
