@@ -1,181 +1,195 @@
-#!/usr/bin/env python3
 import os
-import sys
 import time
-import threading
 
 import RPi.GPIO as GPIO
 
+from modem import get_imei
 from config_remote import get_config
 from motors import setup_motors, spin
 from wordpress import next_command, ack_command, heartbeat, set_screen_mode
 
-# Where the browser kiosk script reads its URL from
+# Where the browser launcher looks for the URL
 KIOSK_URL_FILE = "/home/meadow/kiosk.url"
 
-# PIR settings
-PIR_PIN = 17         # Your chosen PIR pin (BCM)
-ADS_IDLE_SECONDS = 30
-HEARTBEAT_SECONDS = 60
-COMMAND_POLL_SECONDS = 2
-THANKYOU_SECONDS = 5
+# Fallbacks if WP doesn't provide values
+DEFAULT_ADS_TIMEOUT = 30       # seconds before switching to ads
+DEFAULT_IDLE_TIMEOUT = 300     # seconds before turning the screen off
 
-_allow_pir_screen_changes = True
+
+def screen_on():
+    """
+    Best-effort attempt to turn the HDMI display on.
+    On Pi 5 this may log vc_gencmd warnings but is harmless.
+    """
+    os.system("vcgencmd display_power 1")
+
+
+def screen_off():
+    """
+    Best-effort attempt to turn the HDMI display off.
+    """
+    os.system("vcgencmd display_power 0")
 
 
 def write_kiosk_url(cfg):
-    base = cfg.get("domain", "").rstrip("/")
-    page = cfg.get("kiosk_page", "/")
-    url = f"{base}{page}"
+    """
+    Build the full kiosk URL from WordPress config and write it to KIOSK_URL_FILE.
 
+    Example: https://yourdomain.com/kiosk1
+    """
+    base = cfg["domain"].rstrip("/")
+    page = cfg["kiosk_page"]  # e.g. "/kiosk1"
+    url = base + page
     try:
-        os.makedirs(os.path.dirname(KIOSK_URL_FILE), exist_ok=True)
         with open(KIOSK_URL_FILE, "w") as f:
-            f.write(url + "\n")
-        print(f"Kiosk URL written to {KIOSK_URL_FILE} => {url}", flush=True)
+            f.write(url.strip() + "\n")
+        print("Kiosk URL written to", KIOSK_URL_FILE, "=>", url, flush=True)
     except Exception as e:
-        print(f"Failed to write kiosk URL file: {e}", file=sys.stderr, flush=True)
-
-
-def setup_gpio():
-    GPIO.setwarnings(False)
-    GPIO.setmode(GPIO.BCM)
-
-
-def pir_watcher_thread(cfg):
-    global _allow_pir_screen_changes
-
-    last_motion_ts = time.time()
-    current_mode = "ads"
-
-    try:
-        set_screen_mode(cfg, "ads")
-        print("[PIR] Initial ADS mode", flush=True)
-    except Exception:
-        pass
-
-    while True:
-        try:
-            now = time.time()
-            pir_state = GPIO.input(PIR_PIN)
-
-            # Motion
-            if pir_state:
-                last_motion_ts = now
-                if _allow_pir_screen_changes and current_mode != "browse":
-                    try:
-                        set_screen_mode(cfg, "browse")
-                        current_mode = "browse"
-                        print("[PIR] Motion -> browse", flush=True)
-                    except Exception:
-                        pass
-
-            # No motion — idle timeout
-            elif (
-                _allow_pir_screen_changes
-                and current_mode != "ads"
-                and (now - last_motion_ts) > ADS_IDLE_SECONDS
-            ):
-                try:
-                    set_screen_mode(cfg, "ads")
-                    current_mode = "ads"
-                    print("[PIR] Idle -> ads", flush=True)
-                except Exception:
-                    pass
-
-            time.sleep(0.2)
-
-        except Exception as e:
-            print(f"[PIR] Error: {e}", flush=True)
-            time.sleep(1)
-
-
-def vend_one_command(cfg, motors_map, cmd):
-    global _allow_pir_screen_changes
-
-    cmd_id = cmd.get("id")
-    motor_num = str(cmd.get("motor"))
-
-    if not cmd_id or not motor_num:
-        print("[VEND] Invalid command", flush=True)
-        return
-
-    pin = motors_map.get(motor_num)
-    if not pin:
-        print(f"[VEND] Unknown motor {motor_num}", flush=True)
-        ack_command(cfg, cmd_id, success=False)
-        return
-
-    seconds = float(cfg.get("spin_time", {}).get(motor_num, 2.0))
-
-    print(f"[VEND] Starting vend motor {motor_num} on pin {pin}", flush=True)
-
-    _allow_pir_screen_changes = False
-
-    try:
-        set_screen_mode(cfg, "vending")
-        spin(pin, seconds)
-        ack_command(cfg, cmd_id, success=True)
-        print(f"[VEND] Vend done", flush=True)
-
-    except Exception as e:
-        print(f"[VEND] Error: {e}", flush=True)
-        ack_command(cfg, cmd_id, success=False)
-
-    finally:
-        time.sleep(THANKYOU_SECONDS)
-        _allow_pir_screen_changes = True
+        print("Failed to write kiosk URL file:", e, flush=True)
 
 
 def main():
     print("=== Meadow Kiosk Starting ===", flush=True)
 
-    setup_gpio()
+    GPIO.setmode(GPIO.BCM)
 
-    # IMEI not used in this build
+    # 1) Get IMEI from SIM7600 (if present)
     imei = None
+    try:
+        imei = get_imei()
+    except Exception as e:
+        print("Error getting IMEI:", e, flush=True)
+
     print("IMEI:", imei, flush=True)
 
+    # 2) Get config from WordPress (or cache)
     cfg = get_config(imei=imei)
-    print(f"Config loaded for kiosk {cfg.get('kiosk_id')}", flush=True)
+    print("Config loaded for kiosk", cfg["kiosk_id"], flush=True)
 
+    # cfg example:
+    # {
+    #   "kiosk_id": 1,
+    #   "domain": "https://yourdomain.com",
+    #   "api_key": "SECRET",
+    #   "motors": {"1": 22, "2": 23, "3": 24},
+    #   "spin_time": {"1": 1.25, "2": 1.10, "3": 1.40},
+    #   "kiosk_page": "/kiosk1",
+    #   "ads_page": "/kiosk1-ads",
+    #   "config_version": 4,
+    #   "pir_pin": 17,
+    #   "ads_timeout": 30,
+    #   "idle_timeout": 300,
+    #   ...
+    # }
+
+    motors_map = cfg.get("motors", {})          # motor_id -> GPIO pin
+    spin_times = cfg.get("spin_time", {})       # motor_id -> seconds
+
+    # 2b) PIR + timeouts from WP (with defaults)
+    pir_pin = int(cfg.get("pir_pin", 0) or 0)
+    ads_timeout = int(cfg.get("ads_timeout", DEFAULT_ADS_TIMEOUT) or DEFAULT_ADS_TIMEOUT)
+    idle_timeout = int(cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT) or DEFAULT_IDLE_TIMEOUT)
+
+    # 3) Write kiosk URL so browser launcher knows where to go
     write_kiosk_url(cfg)
 
-    motors_map = cfg.get("motors", {})
-    spin_times = cfg.get("spin_time", {})
-    if not motors_map:
-        print("[BOOT] WARNING: no motors configured in config", flush=True)
-
+    # 4) Setup GPIO for motors
     setup_motors(motors_map)
-    GPIO.setup(PIR_PIN, GPIO.IN)
-    print(f"[BOOT] PIR configured on BCM {PIR_PIN}", flush=True)
 
-    pir_thread = threading.Thread(target=pir_watcher_thread, args=(cfg,), daemon=True)
-    pir_thread.start()
+    # 5) Setup PIR (if configured)
+    if pir_pin > 0:
+        # Match your known-good test: PUD_DOWN
+        GPIO.setup(pir_pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+        print(f"[BOOT] PIR configured on BCM {pir_pin} with PUD_DOWN", flush=True)
+    else:
+        print("[BOOT] No PIR configured (pir_pin <= 0 in config)", flush=True)
 
+    # Initial state
+    last_motion = time.time()
     last_heartbeat = 0
+    current_mode = "ads"
+
+    # Turn screen on and announce initial mode
+    screen_on()
+    heartbeat(cfg, imei=imei)
+    print("[HB] Heartbeat sent", flush=True)
+    set_screen_mode(cfg, current_mode)
 
     try:
         while True:
             now = time.time()
 
-            if now - last_heartbeat > HEARTBEAT_SECONDS:
+            # --- PIR / screen-mode logic (only if PIR configured) ---
+            if pir_pin > 0:
+                pir_state = GPIO.input(pir_pin)
+
+                # Motion detected
+                if pir_state == 1:
+                    last_motion = now
+                    screen_on()
+
+                    # Only let PIR move us between ads <-> browse.
+                    # Don't override vending/thankyou/error states.
+                    if current_mode in ("ads", "browse"):
+                        if current_mode != "browse":
+                            current_mode = "browse"
+                            print("[PIR] Motion -> browse", flush=True)
+                            set_screen_mode(cfg, current_mode)
+
+                idle_for = now - last_motion
+
+                # After ads_timeout seconds of no motion, go to ads
+                if idle_for > ads_timeout and current_mode == "browse":
+                    current_mode = "ads"
+                    print("[PIR] Idle -> ads", flush=True)
+                    set_screen_mode(cfg, current_mode)
+
+                # After idle_timeout seconds of no motion, turn screen off
+                if idle_for > idle_timeout:
+                    screen_off()
+            # If no PIR configured, just leave mode/screen control to WP
+
+            # --- Poll WP for vend commands ---
+            cmd = next_command(cfg)
+            if cmd:
+                motor_id = str(cmd["motor"])
+                cmd_id = cmd["id"]
+
+                # For safety, only touch motors in 'vending' mode kiosks
+                kiosk_mode = cfg.get("mode", "vending")
+
+                if kiosk_mode == "vending" and motor_id in motors_map:
+                    pin = motors_map[motor_id]
+                    duration = float(spin_times.get(motor_id, 1.2))
+
+                    # Tell WP we are vending
+                    current_mode = "vending"
+                    set_screen_mode(cfg, current_mode)
+
+                    try:
+                        print(f"[VEND] Motor {motor_id} on pin {pin} for {duration}s", flush=True)
+                        spin(pin, duration)
+                        ack_command(cfg, cmd_id, success=True)
+                        print(f"[VEND] Complete OK for command {cmd_id}", flush=True)
+                    except Exception as e:
+                        print(f"[VEND] ERROR for command {cmd_id}: {e}", flush=True)
+                        ack_command(cfg, cmd_id, success=False)
+                else:
+                    # Unknown motor or non-vending mode kiosk
+                    print(f"[VEND] Reject command {cmd_id}: invalid motor or kiosk mode", flush=True)
+                    ack_command(cfg, cmd_id, success=False)
+
+            # --- Heartbeat every 60 seconds ---
+            if now - last_heartbeat > 60:
                 heartbeat(cfg, imei=imei)
                 last_heartbeat = now
                 print("[HB] Heartbeat sent", flush=True)
 
-            cmd = next_command(cfg)
-            if cmd:
-                print("[CMD] Received:", cmd, flush=True)
-                vend_one_command(cfg, motors_map, cmd)
-            else:
-                time.sleep(COMMAND_POLL_SECONDS)
+            time.sleep(0.2)
 
-    except KeyboardInterrupt:
-        pass
     finally:
         GPIO.cleanup()
-        print("GPIO cleaned up", flush=True)
+        print("GPIO cleaned up, exiting.", flush=True)
 
 
 if __name__ == "__main__":
