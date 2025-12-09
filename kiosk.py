@@ -38,7 +38,7 @@ def write_kiosk_url(cfg):
 
 
 def main():
-    print("=== Meadow Kiosk Starting ===", flush=True)
+    print("=== Meadow Kiosk Starting (TOUCH VERSION – no PIR) ===", flush=True)
 
     GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
@@ -51,7 +51,7 @@ def main():
     cfg = get_config(imei=imei)
     print("Config loaded for kiosk", cfg["kiosk_id"], flush=True)
 
-    # cfg shape:
+    # cfg shape (from WP):
     # {
     #   "kiosk_id": 1,
     #   "domain": "https://yourdomain.com",
@@ -62,9 +62,10 @@ def main():
     #   "ads_page": "/kiosk1-ads",
     #   "config_version": 4,
     #   "mode": "vending" | "display_collect" | "display_only",
-    #   "pir_pin": 22,
-    #   "ads_timeout": 30,
-    #   "idle_timeout": 300,
+    #   # PIR-related fields are ignored in this touch version:
+    #   # "pir_pin": 22,
+    #   # "ads_timeout": 30,
+    #   # "idle_timeout": 300,
     #   "thankyou_timeout": 10,
     #   ...
     # }
@@ -72,11 +73,8 @@ def main():
     motors_map = cfg["motors"]        # motor_id -> GPIO pin
     spin_times = cfg["spin_time"]     # motor_id -> seconds
 
-    # PIR / timeout settings from WP (with sane defaults)
-    pir_pin = int(cfg.get("pir_pin", 22))             # default BCM 22 if not set
-    ads_timeout = int(cfg.get("ads_timeout", 30))     # no motion -> back to ads
-    idle_timeout = int(cfg.get("idle_timeout", 300))  # no motion -> screen off
-    thankyou_timeout = int(cfg.get("thankyou_timeout", 10))  # how long thankyou/error stays
+    # Only thankyou timeout is still used on the Pi side
+    thankyou_timeout = int(cfg.get("thankyou_timeout", 10))
 
     # 3) Write kiosk URL so browser launcher knows where to go
     write_kiosk_url(cfg)
@@ -84,15 +82,7 @@ def main():
     # 4) Setup GPIO outputs for motors
     setup_motors(motors_map)
 
-    # 5) Setup PIR (if configured)
-    if pir_pin > 0:
-        GPIO.setup(pir_pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-        print(f"[BOOT] PIR configured on BCM {pir_pin}", flush=True)
-    else:
-        print("[BOOT] PIR disabled (pir_pin <= 0)", flush=True)
-
     # State
-    last_motion = time.time()
     last_heartbeat = 0
     current_mode = "ads"   # idle mode on boot
     in_vend = False        # True while a motor is spinning
@@ -105,45 +95,24 @@ def main():
     heartbeat(cfg, imei=imei)
     print("[HB] Heartbeat sent", flush=True)
     set_screen_mode(cfg, current_mode)
-    print("[PIR] Initial ADS mode", flush=True)
+    print("[SCREEN] Initial ADS mode (touch-activated kiosk)", flush=True)
 
     try:
         while True:
             now = time.time()
 
-            # --- PIR / screen-mode logic (only if PIR configured and NOT vending) ---
-            if pir_pin > 0 and not in_vend:
-                pir_state = GPIO.input(pir_pin)
-
-                # Motion detected
-                if pir_state == 1:
-                    last_motion = now
-                    screen_on()
-                    # Only flip ads -> browse, don't override vending/thankyou/error
-                    if current_mode in ("ads", "browse") and current_mode != "browse":
-                        current_mode = "browse"
-                        print("[PIR] Motion -> browse", flush=True)
-                        set_screen_mode(cfg, current_mode)
-
-                idle_for = now - last_motion
-
-                # After ads_timeout seconds of no motion, go to ads (from browse)
-                if idle_for > ads_timeout and current_mode == "browse":
-                    current_mode = "ads"
-                    print("[PIR] Idle -> ads", flush=True)
-                    set_screen_mode(cfg, current_mode)
-
-                # After idle_timeout seconds of no motion, turn screen off
-                if idle_for > idle_timeout:
-                    screen_off()
-
             # --- Auto-reset thankyou / error back to ads after thankyou_timeout ---
+            # WP/frontend is responsible for showing the 'thankyou' screen. After
+            # thankyou_timeout seconds we tell WP to go back to ADS.
             if thankyou_started_at is not None:
                 elapsed = now - thankyou_started_at
                 if elapsed > thankyou_timeout:
                     current_mode = "ads"
-                    print(f"[SCREEN] Thankyou/error for {elapsed:.1f}s "
-                          f"> {thankyou_timeout}s -> ads", flush=True)
+                    print(
+                        f"[SCREEN] Thankyou/error for {elapsed:.1f}s "
+                        f"> {thankyou_timeout}s -> ads",
+                        flush=True,
+                    )
                     set_screen_mode(cfg, current_mode)
                     thankyou_started_at = None
 
@@ -160,20 +129,29 @@ def main():
                     pin = motors_map[motor_id]
                     duration = float(spin_times.get(motor_id, 1.2))
 
-                    # Tell WP we are vending
+                    # Tell WP we are vending (frontend can show "Vending..." UI)
                     current_mode = "vending"
                     set_screen_mode(cfg, current_mode)
 
                     in_vend = True
                     try:
-                        print(f"[VEND] Motor {motor_id} on pin {pin} for {duration}s", flush=True)
+                        print(
+                            f"[VEND] Motor {motor_id} on pin {pin} for {duration}s",
+                            flush=True,
+                        )
                         spin(pin, duration)
                         ack_command(cfg, cmd_id, success=True)
-                        print(f"[VEND] Complete OK for command {cmd_id}", flush=True)
+                        print(
+                            f"[VEND] Complete OK for command {cmd_id}",
+                            flush=True,
+                        )
                         # WP will switch to 'thankyou' in /command-complete
                         thankyou_started_at = time.time()
                     except Exception as e:
-                        print(f"[VEND] ERROR for command {cmd_id}: {e}", flush=True)
+                        print(
+                            f"[VEND] ERROR for command {cmd_id}: {e}",
+                            flush=True,
+                        )
                         ack_command(cfg, cmd_id, success=False)
                         # WP will switch to 'error' in /command-complete
                         thankyou_started_at = time.time()
@@ -182,8 +160,11 @@ def main():
 
                 else:
                     # Kiosk is not in vending mode or unknown motor ID
-                    print(f"[VEND] Ignored command {cmd_id} "
-                          f"(mode={kiosk_mode}, motor_id={motor_id})", flush=True)
+                    print(
+                        f"[VEND] Ignored command {cmd_id} "
+                        f"(mode={kiosk_mode}, motor_id={motor_id})",
+                        flush=True,
+                    )
                     ack_command(cfg, cmd_id, success=False)
 
             # --- Heartbeat every 60 seconds ---
