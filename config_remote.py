@@ -29,36 +29,47 @@ def save_cached_config(cfg):
         pass
 
 
-def fetch_config_from_wp(prov, imei=None, timeout=8):
+def fetch_config_from_wp(prov, imei=None, timeout=10):
     """
     Fetch per-kiosk config from WordPress.
 
-    Expected provision.json shape (minimum):
+    provision.json (boot) expected minimum:
       {
-        "domain": "https://yourdomain.com",
-        "kiosk_token": "SOME_SECRET_TOKEN"
+        "domain": "https://meadowvending.com",
+        "kiosk_token": "UNIT-0001-SPARTAN",
+        "api_key": "MASTER-PROVISION-KEY"
       }
 
-    WP endpoint expected:
-      GET {domain}/wp-json/meadow/v1/kiosk-config?kiosk_token=...&imei=...
+    WordPress endpoint (per your plugin):
+      GET {domain}/wp-json/meadow/v1/kiosk-config?token=...&key=...&imei=...
 
-    Returns a dict config used by kiosk.py, including:
-      kiosk_id, domain, api_key, motors, spin_time, kiosk_page, ads_page, thankyou_timeout, mode,
-      OPTIONAL: sigma_terminal_id (per kiosk)
+    Returns dict used by kiosk.py.
     """
-    domain = prov.get("domain")
-    kiosk_token = prov.get("kiosk_token") or prov.get("token")
+    domain = (prov.get("domain") or prov.get("provision_url") or "").strip()
+    kiosk_token = (prov.get("kiosk_token") or prov.get("token") or "").strip()
+    master_key = (prov.get("api_key") or prov.get("key") or "").strip()
 
-    if not domain or not kiosk_token:
-        raise RuntimeError("provision.json missing domain or kiosk_token")
+    if not domain or not kiosk_token or not master_key:
+        raise RuntimeError(
+            f"provision.json missing domain/kiosk_token/api_key. Loaded keys: {list(prov.keys())}"
+        )
 
     url = domain.rstrip("/") + "/wp-json/meadow/v1/kiosk-config"
-    params = {"kiosk_token": kiosk_token}
+
+    # IMPORTANT: match WP plugin param names
+    params = {
+        "token": kiosk_token,
+        "key": master_key,
+    }
     if imei:
         params["imei"] = imei
 
     r = requests.get(url, params=params, timeout=timeout)
-    r.raise_for_status()
+
+    # Better error output than raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"kiosk-config failed {r.status_code}: {r.text[:500]}")
+
     cfg = r.json()
 
     # Ensure domain included in cfg (Pi relies on it)
