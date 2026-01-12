@@ -7,39 +7,34 @@ sudo apt upgrade -y
 
 echo "=== Installing system dependencies ==="
 sudo apt install -y \
-    git \
-    python3-pip \
-    python3-serial \
-    python3-rpi-lgpio \
-    chromium \
-    modemmanager \
-    network-manager \
-    usb-modeswitch \
-    ppp \
-    unclutter
+  git \
+  python3 \
+  python3-serial \
+  python3-rpi-lgpio \
+  chromium-browser \
+  unclutter \
+  modemmanager \
+  network-manager \
+  usb-modeswitch \
+  ca-certificates
 
-echo "=== Installing Python modules ==="
-pip3 install --break-system-packages requests pyserial
+echo "=== Creating state directory ==="
+sudo mkdir -p /home/meadow/state
+sudo chown -R meadow:meadow /home/meadow/state
 
-echo "=== Enabling UART for SIM7600 ==="
-sudo raspi-config nonint do_serial 2
+echo "=== Installing myPOS Sigma udev rule (creates /dev/sigma) ==="
+sudo cp hardware/mypos-sigma/udev/99-mypos-sigma.rules /etc/udev/rules.d/99-mypos-sigma.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+echo "If Sigma is already plugged in, unplug/replug USB to get /dev/sigma."
 
-echo "=== Creating Chromium kiosk autostart (dynamic URL from WP) ==="
+echo "=== Installing browser launcher ==="
+sudo cp kiosk-browser.sh /home/meadow/kiosk-browser.sh
+sudo chmod +x /home/meadow/kiosk-browser.sh
+sudo chown meadow:meadow /home/meadow/kiosk-browser.sh
+
+echo "=== Setting LXDE autostart (kiosk browser) ==="
 mkdir -p ~/.config/lxsession/LXDE-pi
-
-cat <<'EOF' > /home/meadow/kiosk-browser.sh
-#!/bin/bash
-URL_FILE="/home/meadow/kiosk.url"
-while [ ! -s "$URL_FILE" ]; do
-  sleep 1
-done
-URL=$(tr -d '\r\n' < "$URL_FILE")
-[ -z "$URL" ] && URL="https://google.com"
-chromium --noerrdialogs --disable-infobars --kiosk "$URL"
-EOF
-
-chmod +x /home/meadow/kiosk-browser.sh
-
 cat <<'EOF' > ~/.config/lxsession/LXDE-pi/autostart
 @unclutter
 @xset s off
@@ -49,8 +44,9 @@ cat <<'EOF' > ~/.config/lxsession/LXDE-pi/autostart
 EOF
 
 echo "=== Installing systemd service ==="
-sudo cp systemd/meadow-kiosk.service /etc/systemd/system/
+sudo cp systemd/meadow-kiosk.service /etc/systemd/system/meadow-kiosk.service
+sudo systemctl daemon-reload
 sudo systemctl enable meadow-kiosk
+sudo systemctl restart meadow-kiosk || true
 
 echo "=== Install complete. Reboot recommended. ==="
-
