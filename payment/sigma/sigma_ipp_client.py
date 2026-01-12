@@ -29,36 +29,42 @@ class SigmaIPP:
     # -----------------------------
     # Low-level framing
     # -----------------------------
-    def _send_frame(self, ser, lines):
-        payload = ("".join([ln + "\r\n" for ln in lines])).encode("ascii")
-        total_len = len(payload) + 2
-        ser.write(total_len.to_bytes(2, "big") + payload)
-        ser.flush()
+def _send_frame(self, ser, lines):
+    payload = "".join([ln + "\r\n" for ln in lines])
+    logging.debug(">> SEND:\n%s", payload.strip())
 
-    def _read_frame(self, ser, timeout=5.0):
-        end = time.time() + float(timeout)
-        while time.time() < end:
-            hdr = ser.read(2)
-            if len(hdr) < 2:
-                continue
+    data = payload.encode("ascii")
+    total_len = len(data) + 2
+    ser.write(total_len.to_bytes(2, "big") + data)
+    ser.flush()
 
-            total_len = int.from_bytes(hdr, "big")
-            if total_len < 3:
-                continue
+def _read_frame(self, ser, timeout=5.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        hdr = ser.read(2)
+        if len(hdr) < 2:
+            continue
 
-            payload = ser.read(total_len - 2)
-            if len(payload) < (total_len - 2):
-                continue
+        total_len = int.from_bytes(hdr, "big")
+        if total_len < 3:
+            continue
 
-            txt = payload.decode("ascii", errors="replace")
-            props = {}
-            for ln in txt.split("\r\n"):
-                if "=" in ln:
-                    k, v = ln.split("=", 1)
-                    props[k] = v
-            return props, txt
+        payload = ser.read(total_len - 2)
+        if len(payload) < (total_len - 2):
+            continue
 
-        return None, None
+        txt = payload.decode("ascii", errors="replace")
+        logging.debug("<< RECV:\n%s", txt.strip())
+
+        props = {}
+        for ln in txt.split("\r\n"):
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                props[k] = v
+        return props, txt
+
+    return None, None
+
 
     def _toggle_lines(self, ser):
         # Some CDC-ACM devices behave better after DTR/RTS toggles
