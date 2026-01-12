@@ -41,7 +41,9 @@ def save_cached_config(cfg):
 def safe_fallback_config(prov=None, imei=None, reason=None):
     """
     Minimal config that guarantees kiosk.py can boot.
-    Used when WP + cache are unavailable.
+    Used when WP + cache are unavailable or invalid.
+
+    IMPORTANT: Must include keys that kiosk.py directly indexes.
     """
     domain = ""
     kiosk_token = ""
@@ -56,11 +58,17 @@ def safe_fallback_config(prov=None, imei=None, reason=None):
         "domain": domain,
         "kiosk_token": kiosk_token,
         "imei": imei or "",
-        "motors": {},               # REQUIRED by kiosk.py
-        "motor_pulse_ms": 350,
+
+        # Keys kiosk.py expects to exist:
+        "motors": {},          # motor_id -> GPIO pin
+        "spin_time": {},       # motor_id -> seconds (or ms depending on your codebase)
+        "motor_pulse_ms": 350, # if you use pulse-based mode anywhere
+
+        # Behaviour flags:
         "vend": {"enabled": False},
         "payment": {"enabled": False},
         "ads": {"enabled": True},
+
         "updated_at": int(time.time()),
     }
 
@@ -68,37 +76,47 @@ def safe_fallback_config(prov=None, imei=None, reason=None):
 def normalize_config(cfg, prov=None, imei=None):
     """
     Ensure kiosk.py never crashes due to missing keys.
-    This is the contract boundary between config + app.
+
+    This should contain every config key that kiosk.py uses via cfg["..."].
+    (We already know motors + spin_time are required.)
     """
     if not isinstance(cfg, dict):
         cfg = {}
 
-    # ---- REQUIRED KEYS ----
-    cfg.setdefault("motors", {})
+    # --- Required keys (kiosk.py indexes directly) ---
+    cfg.setdefault("motors", {})      # motor_id -> GPIO pin
+    cfg.setdefault("spin_time", {})   # motor_id -> seconds
     cfg.setdefault("motor_pulse_ms", 350)
 
-    # ---- IDENTIFIERS ----
+    # --- Identifiers ---
     if prov and isinstance(prov, dict):
         cfg.setdefault(
-            "domain",
-            (prov.get("domain") or prov.get("provision_url") or "").strip()
-        )
-        cfg.setdefault(
-            "kiosk_token",
-            (prov.get("kiosk_token") or prov.get("token") or "").strip()
-        )
+and
+        cfg.setdefault("domain", (prov.get("domain") or prov.get("provision_url") or "").strip())
+        cfg.setdefault("kiosk_token", (prov.get("kiosk_token") or prov.get("token") or "").strip())
 
     if imei:
         cfg.setdefault("imei", imei)
 
-    # ---- SAFE MODE ENFORCEMENT ----
-    if not cfg.get("motors"):
-        cfg.setdefault("mode", "safe")
-        cfg.setdefault("vend", {})
-        cfg["vend"]["enabled"] = False
+    # --- Behaviour defaults ---
+    cfg.setdefault("vend", {})
+    cfg.setdefault("payment", {})
+    cfg.setdefault("ads", {})
 
-        cfg.setdefault("payment", {})
-        cfg["payment"].setdefault("enabled", False)
+    # If motors or spin_time are missing/empty, force safe mode & disable vend/payment
+    if not cfg.get("motors") or not cfg.get("spin_time"):
+        cfg.setdefault("mode", "safe")
+        cfg["vend"]["enabled"] = False
+        cfg["payment"]["enabled"] = False
+        cfg["ads"].setdefault("enabled", True)
+
+    # Always ensure enabled flags exist (prevents KeyError if you do cfg["vend"]["enabled"])
+    cfg["vend"].setdefault("enabled", True)
+    cfg["payment"].setdefault("enabled", True)
+    cfg["ads"].setdefault("enabled", True)
+
+    # Timestamp marker
+    cfg.setdefault("updated_at", int(time.time()))
 
     return cfg
 
@@ -132,10 +150,7 @@ def fetch_config_from_wp(prov, imei=None, timeout=10):
 
     url = domain.rstrip("/") + "/wp-json/meadow/v1/kiosk-config"
 
-    params = {
-        "token": kiosk_token,
-        "key": master_key,
-    }
+    params = {"token": kiosk_token, "key": master_key}
     if imei:
         params["imei"] = imei
 
@@ -146,19 +161,13 @@ def fetch_config_from_wp(prov, imei=None, timeout=10):
 
     if r.status_code != 200:
         body_preview = (r.text or "")[:500]
-        raise RuntimeError(
-            f"kiosk-config failed {r.status_code} at {url}: {body_preview}"
-        )
+        raise RuntimeError(f"kiosk-config failed {r.status_code} at {url}: {body_preview}")
 
     cfg = r.json()
-
-    # Ensure domain exists for downstream usage
     cfg.setdefault("domain", domain)
 
-    # Normalise + cache
     cfg = normalize_config(cfg, prov=prov, imei=imei)
     save_cached_config(cfg)
-
     return cfg
 
 
@@ -170,12 +179,12 @@ def get_config(imei=None):
     """
     Main entry point used by kiosk.py
 
-    Order of precedence:
+    Order:
       1) Remote WP config
       2) Cached config
       3) Safe fallback config
 
-    This function MUST NEVER raise.
+    MUST NEVER raise (kiosk must boot).
     """
     prov = load_provision()
 
@@ -193,5 +202,5 @@ def get_config(imei=None):
         return normalize_config(
             safe_fallback_config(prov=prov, imei=imei, reason=str(e)[:300]),
             prov=prov,
-            imei=imei
+            imei=imei,
         )
