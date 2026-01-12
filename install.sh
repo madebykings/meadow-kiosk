@@ -11,7 +11,7 @@ sudo apt install -y \
   python3 \
   python3-serial \
   python3-rpi-lgpio \
-  chromium-browser \
+  chromium \
   unclutter \
   modemmanager \
   network-manager \
