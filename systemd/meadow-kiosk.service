@@ -7,12 +7,32 @@ Wants=network-online.target systemd-resolved.service
 Type=simple
 User=meadow
 WorkingDirectory=/home/meadow/meadow-kiosk
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/meadow/meadow-kiosk/kiosk.py
+
+# Resilience
 Restart=always
 RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Hardening (safe defaults for this app)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+UMask=007
+
 StandardOutput=journal
 StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-
