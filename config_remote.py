@@ -61,7 +61,7 @@ def safe_fallback_config(prov=None, imei=None, reason=None):
 
         # Keys kiosk.py expects to exist:
         "motors": {},          # motor_id -> GPIO pin
-        "spin_time": {},       # motor_id -> seconds (or ms depending on your codebase)
+        "spin_time": {},       # motor_id -> seconds
         "motor_pulse_ms": 350, # if you use pulse-based mode anywhere
 
         # Behaviour flags:
@@ -77,23 +77,27 @@ def normalize_config(cfg, prov=None, imei=None):
     """
     Ensure kiosk.py never crashes due to missing keys.
 
-    This should contain every config key that kiosk.py uses via cfg["..."].
+    Add here every config key that kiosk.py uses via cfg["..."].
     (We already know motors + spin_time are required.)
     """
     if not isinstance(cfg, dict):
         cfg = {}
 
     # --- Required keys (kiosk.py indexes directly) ---
-    cfg.setdefault("motors", {})      # motor_id -> GPIO pin
-    cfg.setdefault("spin_time", {})   # motor_id -> seconds
+    cfg.setdefault("motors", {})       # motor_id -> GPIO pin
+    cfg.setdefault("spin_time", {})    # motor_id -> seconds
     cfg.setdefault("motor_pulse_ms", 350)
 
     # --- Identifiers ---
     if prov and isinstance(prov, dict):
         cfg.setdefault(
-and
-        cfg.setdefault("domain", (prov.get("domain") or prov.get("provision_url") or "").strip())
-        cfg.setdefault("kiosk_token", (prov.get("kiosk_token") or prov.get("token") or "").strip())
+            "domain",
+            (prov.get("domain") or prov.get("provision_url") or "").strip()
+        )
+        cfg.setdefault(
+            "kiosk_token",
+            (prov.get("kiosk_token") or prov.get("token") or "").strip()
+        )
 
     if imei:
         cfg.setdefault("imei", imei)
@@ -110,7 +114,7 @@ and
         cfg["payment"]["enabled"] = False
         cfg["ads"].setdefault("enabled", True)
 
-    # Always ensure enabled flags exist (prevents KeyError if you do cfg["vend"]["enabled"])
+    # Always ensure enabled flags exist
     cfg["vend"].setdefault("enabled", True)
     cfg["payment"].setdefault("enabled", True)
     cfg["ads"].setdefault("enabled", True)
