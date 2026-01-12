@@ -1,3 +1,4 @@
 # myPOS Sigma (UN20) - stable USB serial alias
+# Creates /dev/sigma for USB CDC-ACM interface
 SUBSYSTEM=="tty", ATTRS{idVendor}=="294a", ATTRS{idProduct}=="3101", ATTRS{product}=="UN20", \
   SYMLINK+="sigma", GROUP="dialout", MODE="0660"
