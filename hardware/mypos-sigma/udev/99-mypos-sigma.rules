@@ -1,0 +1,3 @@
+# myPOS Sigma (UN20) - stable USB serial alias
+SUBSYSTEM=="tty", ATTRS{idVendor}=="294a", ATTRS{idProduct}=="3101", ATTRS{product}=="UN20", \
+  SYMLINK+="sigma", GROUP="dialout", MODE="0660"
