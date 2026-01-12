@@ -2,6 +2,14 @@ import time
 import uuid
 import serial
 
+import logging
+
+LOG_PATH = "/home/meadow/meadow-kiosk/sigma_debug.log"
+logging.basicConfig(
+    filename=LOG_PATH,
+    level=logging.DEBUG,
+    format="%(asctime)s [SIGMA] %(message)s",
+)
 
 class SigmaIPP:
     """
