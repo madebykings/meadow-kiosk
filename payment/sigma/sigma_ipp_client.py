@@ -4,7 +4,8 @@ import serial
 
 
 class SigmaIPP:
-    """Minimal IPP-over-serial client for myPOS Sigma.
+    """
+    Minimal IPP-over-serial client for myPOS Sigma.
 
     Frame format:
       2-byte big-endian length (including header) + ASCII "KEY=VALUE\r\n" lines.
@@ -12,20 +13,21 @@ class SigmaIPP:
     """
 
     def __init__(self, port="/dev/sigma", baud=115200, version="202", timeout=0.2):
-        self.port = port
+        self.port = str(port or "/dev/sigma")
         self.baud = int(baud or 115200)
         self.version = str(version or "202")
         self.timeout = float(timeout or 0.2)
 
-    @staticmethod
-    def _send_frame(ser, lines):
+    # -----------------------------
+    # Low-level framing
+    # -----------------------------
+    def _send_frame(self, ser, lines):
         payload = ("".join([ln + "\r\n" for ln in lines])).encode("ascii")
         total_len = len(payload) + 2
         ser.write(total_len.to_bytes(2, "big") + payload)
         ser.flush()
 
-    @staticmethod
-    def _read_frame(ser, timeout=5.0):
+    def _read_frame(self, ser, timeout=5.0):
         end = time.time() + float(timeout)
         while time.time() < end:
             hdr = ser.read(2)
@@ -50,8 +52,7 @@ class SigmaIPP:
 
         return None, None
 
-    @staticmethod
-    def _toggle_lines(ser):
+    def _toggle_lines(self, ser):
         # Some CDC-ACM devices behave better after DTR/RTS toggles
         try:
             ser.dtr = False
@@ -61,11 +62,13 @@ class SigmaIPP:
             ser.rts = True
             time.sleep(0.2)
         except Exception:
-            # Not all serial backends expose DTR/RTS
+            # Not all adapters expose these
             pass
 
-    def get_status(self):
-        """GET_STATUS (useful for readiness checks)."""
+    # -----------------------------
+    # GET_STATUS (single session)
+    # -----------------------------
+    def _get_status_on_open_serial(self, ser, max_wait=10):
         sid = str(uuid.uuid4())
         lines = [
             "PROTOCOL=IPP",
@@ -73,59 +76,79 @@ class SigmaIPP:
             f"VERSION={self.version}",
             f"SID={sid}",
         ]
+        self._send_frame(ser, lines)
 
-        with serial.Serial(self.port, self.baud, timeout=self.timeout) as ser:
-            self._toggle_lines(ser)
-            self._send_frame(ser, lines)
+        end = time.time() + float(max_wait)
+        last = None
+        while time.time() < end:
+            props, _raw = self._read_frame(ser, timeout=3)
+            if not props:
+                continue
+            last = props
+            if props.get("METHOD") == "GET_STATUS" and props.get("SID") == sid:
+                return props
+        return last
 
-            end = time.time() + 10
-            while time.time() < end:
-                props, _ = self._read_frame(ser, timeout=3)
-                if not props:
-                    continue
-                if props.get("METHOD") == "GET_STATUS" and props.get("SID") == sid:
-                    return props
-        return None
-
+    # -----------------------------
+    # PURCHASE (matches your proven flow)
+    # -----------------------------
     def purchase(self, amount_minor, currency_num="826", reference="", max_wait=180):
-        """Blocking purchase.
+        """
+        Blocking purchase.
 
+        - Opens serial once
+        - Toggles DTR/RTS once
+        - GET_STATUS first (like your proven script)
         - Tries minor units first (e.g. "100" pence)
         - If rejected immediately, tries decimal (e.g. "1.00")
-        - Waits for the final PURCHASE message (TIMEOUT==0) and returns last matching frame.
+        - If accepted, keeps reading until "final" (often TIMEOUT==0)
 
         Returns dict:
           { approved: bool, status: str, stage: str, raw: dict, receipt: str }
         """
 
-        # Normalize formats
+        # Normalize minor units to int
         try:
             minor_int = int(amount_minor)
         except Exception:
-            minor_int = int(float(amount_minor) * 100)
+            minor_int = int(round(float(amount_minor) * 100))
 
         attempts = [
-            str(minor_int),
-            f"{minor_int/100:.2f}",
+            str(minor_int),            # "100"
+            f"{minor_int/100:.2f}",    # "1.00"
         ]
 
         last = None
 
-        for amt in attempts:
-            sid = str(uuid.uuid4())
-            lines = [
-                "PROTOCOL=IPP",
-                "METHOD=PURCHASE",
-                f"VERSION={self.version}",
-                f"SID={sid}",
-                f"AMOUNT={amt}",
-                f"CURRENCY={currency_num}",
-            ]
-            if reference:
-                lines.append(f"REFERENCE={reference}")
+        with serial.Serial(self.port, self.baud, timeout=self.timeout) as ser:
+            self._toggle_lines(ser)
 
-            with serial.Serial(self.port, self.baud, timeout=self.timeout) as ser:
-                self._toggle_lines(ser)
+            # Wake/check terminal (this is the key difference vs your failing output)
+            st = self._get_status_on_open_serial(ser, max_wait=10)
+            # If terminal reports not-ready, bail early but return useful info
+            if not st or str(st.get("STATUS") or "") != "0":
+                return {
+                    "approved": False,
+                    "status": str((st or {}).get("STATUS") or ""),
+                    "stage": str((st or {}).get("STAGE") or ""),
+                    "raw": st or {},
+                    "receipt": str((st or {}).get("RECEIPT") or ""),
+                }
+
+            # Now attempt purchase formats
+            for amt in attempts:
+                sid = str(uuid.uuid4())
+                lines = [
+                    "PROTOCOL=IPP",
+                    "METHOD=PURCHASE",
+                    f"VERSION={self.version}",
+                    f"SID={sid}",
+                    f"AMOUNT={amt}",
+                    f"CURRENCY={currency_num}",
+                ]
+                if reference:
+                    lines.append(f"REFERENCE={reference}")
+
                 self._send_frame(ser, lines)
 
                 # First response: accepted/rejected
@@ -135,6 +158,7 @@ class SigmaIPP:
                     props, _raw = self._read_frame(ser, timeout=5)
                     if not props:
                         continue
+                    # show only matching SID
                     if props.get("METHOD") == "PURCHASE" and props.get("SID") == sid:
                         first_resp = props
                         break
@@ -145,7 +169,7 @@ class SigmaIPP:
 
                 last = first_resp
 
-                # If terminal rejected immediately, try next amount format
+                # If rejected immediately, try next amount format
                 if str(first_resp.get("STATUS") or "") != "0":
                     continue
 
@@ -161,6 +185,7 @@ class SigmaIPP:
                         continue
 
                     last = props
+
                     if seen_after_first:
                         # many firmwares signal completion with TIMEOUT=0
                         if str(props.get("TIMEOUT") or "") in ("", "0"):
@@ -175,8 +200,6 @@ class SigmaIPP:
         stage = str((last or {}).get("STAGE") or "")
 
         # Approval heuristic:
-        # - If final STATUS=="0" we treat as approved
-        # - If RESULT/APPROVED present, honor it
         approved = False
         if last:
             if "APPROVED" in last:
@@ -184,6 +207,7 @@ class SigmaIPP:
             elif "RESULT" in last:
                 approved = str(last.get("RESULT")).upper() in ("APPROVED", "00")
             else:
+                # fall back: STATUS==0
                 approved = (status == "0")
 
         return {
