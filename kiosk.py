@@ -1,23 +1,22 @@
 import time
 import os
+import json
 
 import RPi.GPIO as GPIO
 
 from modem import get_imei
 from config_remote import get_config
 from motors import setup_motors, spin
-from wordpress import (
-    next_command,
-    ack_command,
-    heartbeat,
-    set_screen_mode,
-)
+from wordpress import next_command, ack_command, heartbeat, set_screen_mode
 
-# NEW: Sigma payment client
 from payment.sigma.sigma_ipp_client import SigmaIPP
 
 # Where we'll store the kiosk URL for the browser launcher
 KIOSK_URL_FILE = "/home/meadow/kiosk.url"
+
+# Simple persistent state to prevent double-charge / double-vend
+STATE_DIR = "/home/meadow/state"
+CMD_STALE_SECONDS = 5 * 60  # treat "started" older than this as stale
 
 
 def screen_on():
@@ -45,6 +44,34 @@ def write_kiosk_url(cfg):
         print("Failed to write kiosk URL file:", e, flush=True)
 
 
+def _state_path(cmd_id: int) -> str:
+    return os.path.join(STATE_DIR, f"cmd_{cmd_id}.json")
+
+
+def load_cmd_state(cmd_id: int):
+    try:
+        with open(_state_path(cmd_id), "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_cmd_state(cmd_id: int, state: dict):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = _state_path(cmd_id) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, _state_path(cmd_id))
+
+
+def is_stale(state: dict) -> bool:
+    try:
+        started_at = float(state.get("started_at", 0))
+        return (time.time() - started_at) > CMD_STALE_SECONDS and not state.get("vended")
+    except Exception:
+        return True
+
+
 def main():
     print("=== Meadow Kiosk Starting (TOUCH + myPOS Sigma) ===", flush=True)
 
@@ -57,14 +84,14 @@ def main():
 
     # 2) Get config from WordPress (or cache)
     cfg = get_config(imei=imei)
-    print("Config loaded for kiosk", cfg["kiosk_id"], flush=True)
+    print("Config loaded for kiosk", cfg.get("kiosk_id"), flush=True)
 
     motors_map = cfg["motors"]        # motor_id -> GPIO pin
     spin_times = cfg["spin_time"]     # motor_id -> seconds
     thankyou_timeout = int(cfg.get("thankyou_timeout", 10))
 
-    # Optional (recommended): expected terminal ID check
-    expected_terminal_id = cfg.get("sigma_terminal_id")
+    # Optional per-kiosk terminal lock (recommended)
+    expected_terminal_id = cfg.get("sigma_terminal_id")  # e.g. "80417289"
 
     # 3) Write kiosk URL so browser launcher knows where to go
     write_kiosk_url(cfg)
@@ -72,20 +99,21 @@ def main():
     # 4) Setup GPIO outputs for motors
     setup_motors(motors_map)
 
-    # 5) Init Sigma client (per-kiosk, per-Pi)
+    # 5) Setup Sigma
     sigma = SigmaIPP(port="/dev/sigma", version="202")
 
     # State
     last_heartbeat = 0
     current_mode = "ads"
-    in_vend = False
+    in_action = False
     thankyou_started_at = None
 
+    # Turn screen on and announce initial mode
     screen_on()
     heartbeat(cfg, imei=imei)
+    print("[HB] Heartbeat sent", flush=True)
     set_screen_mode(cfg, current_mode)
-
-    print("[SCREEN] Initial ADS mode", flush=True)
+    print("[SCREEN] Initial ADS mode (touch kiosk)", flush=True)
 
     try:
         while True:
@@ -93,23 +121,23 @@ def main():
 
             # --- Auto-reset thankyou/error back to ads ---
             if thankyou_started_at is not None:
-                if now - thankyou_started_at > thankyou_timeout:
+                elapsed = now - thankyou_started_at
+                if elapsed > thankyou_timeout:
                     current_mode = "ads"
                     set_screen_mode(cfg, current_mode)
                     thankyou_started_at = None
-                    print("[SCREEN] Returned to ADS", flush=True)
+                    print("[SCREEN] Return to ADS", flush=True)
 
-            # --- Poll WP for vend commands ---
+            # --- Poll WP for commands ---
             cmd = next_command(cfg)
-            if cmd and not in_vend:
+            if cmd and not in_action:
+                cmd_id = int(cmd["id"])
                 motor_id = str(cmd["motor"])
-                cmd_id = cmd["id"]
                 kiosk_mode = cfg.get("mode", "vending")
 
                 if kiosk_mode != "vending" or motor_id not in motors_map:
                     print(
-                        f"[VEND] Ignored command {cmd_id} "
-                        f"(mode={kiosk_mode}, motor_id={motor_id})",
+                        f"[CMD] Ignored {cmd_id} (mode={kiosk_mode}, motor_id={motor_id})",
                         flush=True,
                     )
                     ack_command(cfg, cmd_id, success=False)
@@ -117,87 +145,97 @@ def main():
 
                 pin = motors_map[motor_id]
                 duration = float(spin_times.get(motor_id, 1.2))
-
-                # --- PAYMENT STEP ---
                 amount = cmd.get("amount")
+
                 if not amount:
-                    print("[PAY] Missing amount in command", flush=True)
+                    print(f"[CMD] Missing amount for {cmd_id}", flush=True)
                     ack_command(cfg, cmd_id, success=False)
                     continue
 
-                reference = f"KIOSK-{cfg['kiosk_id']}-CMD-{cmd_id}"
+                # Idempotency / anti-double charge/vend
+                state = load_cmd_state(cmd_id)
+                if state:
+                    if is_stale(state):
+                        print(f"[STATE] Stale state for {cmd_id}, resetting", flush=True)
+                        state = None
+                    elif state.get("vended"):
+                        print(f"[STATE] Already vended {cmd_id}, acking", flush=True)
+                        # tell WP it's complete (prevents repeats)
+                        ack_command(cfg, cmd_id, success=True, payment_data=state.get("payment"))
+                        continue
+                    elif state.get("paid") and not state.get("vended"):
+                        print(f"[STATE] Already paid {cmd_id}, will vend without charging again", flush=True)
+                if not state:
+                    state = {"started_at": time.time(), "paid": False, "vended": False, "payment": None}
+                    save_cmd_state(cmd_id, state)
 
-                print(
-                    f"[PAY] Starting payment £{amount} "
-                    f"(ref={reference})",
-                    flush=True,
-                )
+                in_action = True
 
-                current_mode = "payment"
-                set_screen_mode(cfg, current_mode)
+                # If not paid yet, take payment now
+                if not state.get("paid"):
+                    reference = f"KIOSK-{cfg['kiosk_id']}-CMD-{cmd_id}"
 
-                payment = sigma.purchase(
-                    amount=str(amount),
-                    reference=reference,
-                )
-
-                if not payment["success"]:
-                    print("[PAY] DECLINED or TIMEOUT", flush=True)
-                    ack_command(cfg, cmd_id, success=False)
-                    current_mode = "error"
+                    current_mode = "payment"
                     set_screen_mode(cfg, current_mode)
-                    thankyou_started_at = time.time()
-                    continue
+                    print(f"[PAY] PURCHASE £{amount} ref={reference}", flush=True)
 
-                tx = payment["data"]
+                    pay = sigma.purchase(amount=str(amount), reference=reference)
 
-                # Optional terminal-ID sanity check
-                if expected_terminal_id:
-                    if tx.get("TERMINAL_ID") != expected_terminal_id:
+                    if not pay["success"]:
+                        print("[PAY] DECLINED/TIMEOUT", flush=True)
+                        ack_command(cfg, cmd_id, success=False)
+                        current_mode = "error"
+                        set_screen_mode(cfg, current_mode)
+                        thankyou_started_at = time.time()
+                        in_action = False
+                        continue
+
+                    tx = pay["data"] or {}
+
+                    # Optional: ensure this kiosk uses the expected terminal
+                    if expected_terminal_id and tx.get("TERMINAL_ID") != str(expected_terminal_id):
                         print(
-                            "[PAY] Terminal ID mismatch!",
-                            tx.get("TERMINAL_ID"),
+                            f"[PAY] Terminal mismatch expected={expected_terminal_id} got={tx.get('TERMINAL_ID')}",
                             flush=True,
                         )
                         ack_command(cfg, cmd_id, success=False)
+                        current_mode = "error"
+                        set_screen_mode(cfg, current_mode)
+                        thankyou_started_at = time.time()
+                        in_action = False
                         continue
 
-                print(
-                    f"[PAY] APPROVED auth={tx.get('AUTH_CODE')} rrn={tx.get('RRN')}",
-                    flush=True,
-                )
+                    state["paid"] = True
+                    state["payment"] = tx
+                    save_cmd_state(cmd_id, state)
+                    print(f"[PAY] APPROVED rrn={tx.get('RRN')} auth={tx.get('AUTH_CODE')}", flush=True)
 
-                # --- VEND STEP ---
+                # Vend (either after new payment, or retry after crash with paid=True)
                 current_mode = "vending"
                 set_screen_mode(cfg, current_mode)
-                in_vend = True
 
                 try:
-                    print(
-                        f"[VEND] Motor {motor_id} on pin {pin} for {duration}s",
-                        flush=True,
-                    )
+                    print(f"[VEND] Motor {motor_id} pin {pin} for {duration}s (cmd {cmd_id})", flush=True)
                     spin(pin, duration)
 
-                    ack_command(
-                        cfg,
-                        cmd_id,
-                        success=True,
-                        payment_data=tx,  # WP should store metadata
-                    )
+                    state["vended"] = True
+                    save_cmd_state(cmd_id, state)
 
-                    print(f"[VEND] Complete OK for command {cmd_id}", flush=True)
+                    ack_command(cfg, cmd_id, success=True, payment_data=state.get("payment"))
+                    print(f"[VEND] OK cmd {cmd_id}", flush=True)
+
+                    # WP/frontend shows thankyou; Pi auto-returns to ads later
                     thankyou_started_at = time.time()
 
                 except Exception as e:
-                    print(f"[VEND] ERROR: {e}", flush=True)
+                    print(f"[VEND] ERROR cmd {cmd_id}: {e}", flush=True)
                     ack_command(cfg, cmd_id, success=False)
                     thankyou_started_at = time.time()
 
                 finally:
-                    in_vend = False
+                    in_action = False
 
-            # --- Heartbeat every 60s ---
+            # --- Heartbeat every 60 seconds ---
             if now - last_heartbeat > 60:
                 heartbeat(cfg, imei=imei)
                 last_heartbeat = now
