@@ -8,6 +8,9 @@ Type=simple
 User=meadow
 WorkingDirectory=/home/meadow/meadow-kiosk
 Environment=PYTHONUNBUFFERED=1
+Environment=GIT_TERMINAL_PROMPT=0
+ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git fetch --prune origin'
+ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git reset --hard origin/main'
 ExecStart=/usr/bin/python3 /home/meadow/meadow-kiosk/kiosk.py
 
 # Resilience
