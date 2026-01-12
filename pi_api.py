@@ -186,20 +186,28 @@ class Handler(BaseHTTPRequestHandler):
         for port in port_candidates:
             try:
                 sigma = SigmaIPP(port=port, baud=sigma_baud)
-                # Sigma supports minor units (e.g., "100") on many firmware builds
-                resp = sigma.purchase(amount=str(amount_minor_int), currency=currency_num, reference=reference)
-                # Normalise
+                resp = sigma.purchase(amount_minor=amount_minor_int, currency_num=currency_num, reference=reference)
+
+                status = str(resp.get("status") or "")
+                stage = str(resp.get("stage") or "")
                 approved = bool(resp.get("approved"))
-                return _json_response(self, 200, {
-                    "ok": True,
+
+                payload = {
                     "approved": approved,
-                    "status": str(resp.get("status") or ""),
-                    "stage": str(resp.get("stage") or ""),
+                    "status": status,
+                    "stage": stage,
                     "raw": resp.get("raw") or resp,
                     "receipt": resp.get("receipt") or "",
                     "txid": str(resp.get("txid") or ""),
                     "port": port,
-                })
+                }
+
+                # If the terminal rejected the request up-front (e.g. wrong amount format),
+                # return ok=false so the UI doesn't treat it as a completed transaction.
+                if status and status != "0" and not approved:
+                    return _json_response(self, 409, {"ok": False, "error": "sigma_rejected", **payload})
+
+                return _json_response(self, 200, {"ok": True, **payload})
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 continue
