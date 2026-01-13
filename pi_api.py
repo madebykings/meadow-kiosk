@@ -147,20 +147,31 @@ STATE = RuntimeState()
 
 
 def _config_poll_loop() -> None:
-    prov = load_provision()
+    try:
+        prov = load_provision()
+        print("[pi_api] loaded provision:", prov)
+    except Exception as e:
+        print("[pi_api] FAILED to load provision.json")
+        print("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+        return  # no point continuing
 
     while True:
         try:
+            print("[pi_api] polling WP for kiosk config…")
             cfg = fetch_config_from_wp(prov, imei=None, timeout=8)
-            if cfg:
-                STATE.update_from_wp(cfg)
-                STATE.mark_poll_result(True, "")
-            else:
-                STATE.mark_poll_result(False, "fetch_config_from_wp returned empty cfg")
-        except Exception as e:
-            STATE.mark_poll_result(False, f"{type(e).__name__}: {e}")
-        time.sleep(30)
 
+            if not cfg:
+                print("[pi_api] poll returned empty config")
+            else:
+                print("[pi_api] config received OK")
+                STATE.update_from_wp(cfg)
+
+        except Exception as e:
+            err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
+            print("[pi_api] CONFIG POLL FAILED:")
+            print(err)
+
+        time.sleep(30)
 
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
