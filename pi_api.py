@@ -25,11 +25,20 @@ from typing import Any, Dict, Optional, Tuple
 
 from config_remote import load_provision, fetch_config_from_wp
 from motors import MotorController
-from payment.sigma.sigma_ipp_client import SigmaIPP
+
+# NEW: production Sigma client
+from payment.sigma.sigma_ipp_client import SigmaIppClient
 
 
 HOST = "127.0.0.1"
 PORT = 8765
+
+# ISO 4217 numeric -> alpha mapping (extend if needed)
+ISO_NUM_TO_ALPHA = {
+    "826": "GBP",
+    "978": "EUR",
+    "840": "USD",
+}
 
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
@@ -147,12 +156,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/health"):
             sigma_path, sigma_baud = STATE.get_sigma()
             motors_ok = STATE.get_motors() is not None
-            return _json_response(self, 200, {
-                "ok": True,
-                "sigma_path": sigma_path,
-                "sigma_baud": sigma_baud,
-                "motors_loaded": motors_ok,
-            })
+            return _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "sigma_path": sigma_path,
+                    "sigma_baud": sigma_baud,
+                    "motors_loaded": motors_ok,
+                },
+            )
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
@@ -178,36 +191,48 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return _json_response(self, 400, {"ok": False, "error": "bad_amount"})
 
+        # Map numeric currency to alpha for SigmaIppClient
+        currency = ISO_NUM_TO_ALPHA.get(currency_num, "GBP")
+
         sigma_path, sigma_baud = STATE.get_sigma()
-        # Always try udev alias first if configured path missing
+
+        # Always try configured path first then fallbacks
         port_candidates = [sigma_path, "/dev/sigma", "/dev/ttyACM0", "/dev/ttyUSB0"]
 
         last_err = ""
         for port in port_candidates:
             try:
-                sigma = SigmaIPP(port=port, baud=sigma_baud)
-                resp = sigma.purchase(amount_minor=amount_minor_int, currency_num=currency_num, reference=reference)
+                with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
+                    # lifecycle handling is inside SigmaIppClient.purchase()
+                    r = sigma.purchase(
+                        amount_minor=amount_minor_int,
+                        currency=currency,
+                        ref=(reference or None),
+                        max_wait_s=180.0,
+                    )
 
-                status = str(resp.get("status") or "")
-                stage = str(resp.get("stage") or "")
-                approved = bool(resp.get("approved"))
+                status = r.status
+                stage = r.stage
+                approved = bool(status == 0)
 
                 payload = {
                     "approved": approved,
-                    "status": status,
-                    "stage": stage,
-                    "raw": resp.get("raw") or resp,
-                    "receipt": resp.get("receipt") or "",
-                    "txid": str(resp.get("txid") or ""),
+                    "status": str(status if status is not None else ""),
+                    "stage": str(stage if stage is not None else ""),
+                    "raw": r.fields,  # keep verbose for debugging
+                    "receipt": r.fields.get("RECEIPT", "") if isinstance(r.fields, dict) else "",
+                    "txid": str((r.fields.get("TXID") or r.fields.get("RRN") or "") if isinstance(r.fields, dict) else ""),
                     "port": port,
+                    "currency": currency,
                 }
 
-                # If the terminal rejected the request up-front (e.g. wrong amount format),
-                # return ok=false so the UI doesn't treat it as a completed transaction.
-                if status and status != "0" and not approved:
+                # Match your previous semantics:
+                # If terminal rejected / declined (non-zero status and not approved), return 409 so UI doesn't treat as success.
+                if (status is not None) and (status != 0) and (not approved):
                     return _json_response(self, 409, {"ok": False, "error": "sigma_rejected", **payload})
 
                 return _json_response(self, 200, {"ok": True, **payload})
+
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 continue
