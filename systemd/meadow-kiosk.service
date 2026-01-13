@@ -10,6 +10,7 @@ WorkingDirectory=/home/meadow/meadow-kiosk
 Environment=PYTHONUNBUFFERED=1
 Environment=GIT_TERMINAL_PROMPT=0
 Environment="MEADOW_TUNNEL_SECRET=Mvato2025$!"
+Environment="MEADOW_TUNNEL_HEADER=X-Meadow-Tunnel"
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git fetch --prune origin'
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git reset --hard origin/main'
 # Local HTTP API for the kiosk UI -> Pi (Sigma + vend)
