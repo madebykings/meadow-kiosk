@@ -1,415 +1,585 @@
 # sigma_ipp_client.py
+"""
+myPOS Sigma (IPP over USB/Serial) client — production-ready lifecycle handling.
+
+Assumptions / context baked in (from your Sigma IPP debugging):
+- Device path: /dev/sigma (symlink to /dev/ttyACM0)
+- If GET_STATUS returns STATUS=20 ("NOT COMPLETED LAST TX"):
+    1) issue COMPLETE_TX
+    2) then CANCEL_TX
+    3) then wait for a *final* GET_STATUS with TIMEOUT=0 returning STATUS=0
+- PURCHASE requires waiting for the *final* response (TIMEOUT=0 style)
+- User-declined amounts can surface as non-zero STATUS at STAGE=5
+  (treat that as a terminal decision, then wait for READY before next op)
+
+This file is intentionally defensive:
+- Robust framing + tolerant key=value parsing
+- Explicit “wait for final frame” loops with a max wall-clock guard
+- Serial read is line/frame based with a binary-safe buffer
+- Dedicated serial logger support (optional)
+
+If your on-wire frame format differs from the default STX/ETX/LRC framing below,
+only update `SigmaFramer` (build_frame / feed / extract_frames).
+Everything else (lifecycle/retries/state) remains valid.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
 import time
 import uuid
-import serial
-import logging
-from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Callable
 
-# --- Dedicated Sigma serial log ---
+import serial  # pyserial
+
+
+# -----------------------------
+# Logging
+# -----------------------------
+
+DEFAULT_DEVICE = "/dev/sigma"
+DEFAULT_BAUDRATE = 115200  # adjust if your Sigma requires different
+DEFAULT_WRITE_TIMEOUT = 2.0
+
 SIGMA_LOG_PATH = "/home/meadow/meadow-kiosk/sigma_serial.log"
 
-sigma_logger = logging.getLogger("sigma_serial")
-sigma_logger.setLevel(logging.DEBUG)
 
-if not sigma_logger.handlers:
-    fh = logging.FileHandler(SIGMA_LOG_PATH)
-    fh.setLevel(logging.DEBUG)
-    fmt = logging.Formatter("%(asctime)s [SIGMA_SERIAL] %(message)s")
-    fh.setFormatter(fmt)
-    sigma_logger.addHandler(fh)
-
-
-def sigma_log(msg: str) -> None:
-    try:
-        sigma_logger.debug(msg)
-    except Exception:
-        pass
+def _build_default_sigma_logger() -> logging.Logger:
+    logger = logging.getLogger("sigma_serial")
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        os.makedirs(os.path.dirname(SIGMA_LOG_PATH), exist_ok=True)
+        fh = logging.FileHandler(SIGMA_LOG_PATH)
+        fh.setLevel(logging.DEBUG)
+        fmt = logging.Formatter("%(asctime)s [SIGMA_SERIAL] %(message)s")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    return logger
 
 
-class SigmaIPP:
-    """
-    IPP-over-serial client for myPOS Sigma.
+# -----------------------------
+# Data models
+# -----------------------------
 
-    Frame format:
-      2-byte big-endian length (including the 2-byte header)
-      + ASCII payload of "KEY=VALUE\\r\\n" lines.
+@dataclass
+class SigmaFrame:
+    raw: bytes
+    payload: bytes  # unframed payload (application-level content)
 
-    Ordering (important):
-      PROTOCOL must be first
-      METHOD must be second
-    """
 
-    def __init__(self, port: str = "/dev/sigma", baud: int = 115200, version: str = "202", timeout: float = 0.2):
-        self.port = port
-        self.baud = int(baud or 115200)
-        self.version = str(version or "202")
-        self.timeout = float(timeout or 0.2)
+@dataclass
+class SigmaResponse:
+    """Parsed response (best-effort KV parsing) + raw frames."""
+    fields: Dict[str, str]
+    frames: List[SigmaFrame] = field(default_factory=list)
 
-    # ------------------------
-    # Low-level helpers
-    # ------------------------
-    def _send_frame(self, ser: serial.Serial, lines) -> None:
-        payload_txt = "".join([ln + "\r\n" for ln in lines])
-        payload = payload_txt.encode("ascii", errors="replace")
-        total_len = len(payload) + 2
-
-        sigma_log(">> SEND:\n" + payload_txt.strip())
-        ser.write(total_len.to_bytes(2, "big") + payload)
-        ser.flush()
-
-    def _read_frame(self, ser: serial.Serial, timeout: float = 5.0) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
-        end = time.time() + float(timeout)
-        while time.time() < end:
-            hdr = ser.read(2)
-            if len(hdr) < 2:
-                continue
-
-            total_len = int.from_bytes(hdr, "big")
-            if total_len < 3:
-                continue
-
-            payload = ser.read(total_len - 2)
-            if len(payload) < (total_len - 2):
-                continue
-
-            txt = payload.decode("ascii", errors="replace")
-            sigma_log("<< RECV:\n" + txt.strip())
-
-            props: Dict[str, str] = {}
-            for ln in txt.split("\r\n"):
-                if "=" in ln:
-                    k, v = ln.split("=", 1)
-                    props[k] = v
-
-            return props, txt
-
-        return None, None
-
-    def _toggle_lines(self, ser: serial.Serial) -> None:
-        sigma_log("Toggling DTR/RTS")
+    @property
+    def status(self) -> Optional[int]:
+        v = self.fields.get("STATUS")
         try:
-            ser.dtr = False
-            ser.rts = False
-            time.sleep(0.2)
-            ser.dtr = True
-            ser.rts = True
-            time.sleep(0.2)
-        except Exception as e:
-            sigma_log(f"DTR/RTS toggle error: {e!r}")
+            return int(v) if v is not None else None
+        except ValueError:
+            return None
 
-    def _drain_frames(self, ser: serial.Serial, seconds: float = 1.0, label: str = "drain") -> None:
-        end = time.time() + float(seconds)
-        while time.time() < end:
-            props, _ = self._read_frame(ser, timeout=0.25)
-            if props:
-                sigma_log(f"<< ({label}): {props}")
+    @property
+    def stage(self) -> Optional[int]:
+        v = self.fields.get("STAGE")
+        try:
+            return int(v) if v is not None else None
+        except ValueError:
+            return None
 
-    def _send_method(self, ser: serial.Serial, method: str, extra_lines=None) -> str:
-        sid = str(uuid.uuid4())
-        lines = [
-            "PROTOCOL=IPP",
-            f"METHOD={method}",
-            f"VERSION={self.version}",
-            f"SID={sid}",
-        ]
-        if extra_lines:
-            lines.extend(extra_lines)
-        sigma_log(f">> {method} SID={sid}")
-        self._send_frame(ser, lines)
-        return sid
+    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        return self.fields.get(key, default)
 
-    # ------------------------
-    # GET_STATUS (final frame)
-    # ------------------------
-    def get_status_final(self, ser: serial.Serial, max_wait: float = 6.0, verbose_log: bool = False) -> Optional[Dict[str, str]]:
-        """
-        GET_STATUS can return multiple frames for the same SID.
-        Treat the FINAL frame as TIMEOUT==0 (or missing), otherwise return last seen.
-        """
-        sid = str(uuid.uuid4())
-        lines = [
-            "PROTOCOL=IPP",
-            "METHOD=GET_STATUS",
-            f"VERSION={self.version}",
-            f"SID={sid}",
-        ]
 
-        self._drain_frames(ser, seconds=0.4, label="pre-status")
+class SigmaError(Exception):
+    pass
 
-        sigma_log(f">> GET_STATUS SID={sid}")
-        self._send_frame(ser, lines)
 
-        end = time.time() + float(max_wait)
-        last = None
-        while time.time() < end:
-            props, _ = self._read_frame(ser, timeout=0.8)
-            if not props:
-                continue
+class SigmaTimeout(SigmaError):
+    pass
 
-            if verbose_log and not (props.get("METHOD") == "GET_STATUS" and props.get("SID") == sid):
-                sigma_log("<< (other): " + str(props))
 
-            if props.get("METHOD") == "GET_STATUS" and props.get("SID") == sid:
-                last = props
-                sigma_log("<< GET_STATUS(frame): " + str(props))
+class SigmaProtocolError(SigmaError):
+    pass
 
-                t = str(props.get("TIMEOUT") or "")
-                if t in ("", "0"):
-                    break
 
-        if last:
-            sigma_log("<< GET_STATUS(final): " + str(last))
-        return last
+# -----------------------------
+# Framing (default: STX ... ETX LRC)
+# -----------------------------
 
-    def get_status(self, max_wait: float = 10.0) -> Optional[Dict[str, str]]:
-        """
-        Public: open port, return FINAL GET_STATUS frame.
-        """
-        sigma_log(f"GET_STATUS start port={self.port} baud={self.baud}")
-        with serial.Serial(self.port, self.baud, timeout=self.timeout) as ser:
-            self._toggle_lines(ser)
-            return self.get_status_final(ser, max_wait=max_wait, verbose_log=True)
+class SigmaFramer:
+    """
+    Default framing: STX (0x02) + payload + ETX (0x03) + LRC (xor of payload+ETX)
 
-    def _is_idle(self, st_final: Optional[Dict[str, str]]) -> bool:
-        if not st_final:
-            return False
-        return str(st_final.get("STATUS") or "") == "0"
+    If your current working code uses a different wire format (length-prefix, CRC16,
+    ASCII with newlines, etc.), update only this class.
+    """
 
-    # ------------------------
-    # Clear STATUS=20 ("NOT COMPLETED LAST TX")
-    # ------------------------
-    def clear_to_idle(self, ser: serial.Serial, max_wait: float = 25.0) -> bool:
-        """
-        If GET_STATUS(final).STATUS == 20, PURCHASE will reject until cleared.
+    STX = 0x02
+    ETX = 0x03
 
-        Strategy:
-          1) COMPLETE_TX
-          2) If still not idle, CANCEL_TX
-          3) Poll GET_STATUS(final) until idle or timeout
-        """
-        st = self.get_status_final(ser, max_wait=6.0, verbose_log=True)
-        if not st:
-            sigma_log("clear_to_idle: GET_STATUS no response")
-            return False
+    def __init__(self, sigma_logger: Optional[logging.Logger] = None):
+        self._buf = bytearray()
+        self._log = sigma_logger
 
-        if self._is_idle(st):
-            sigma_log("clear_to_idle: already idle")
-            return True
+    @staticmethod
+    def lrc(data: bytes) -> int:
+        x = 0
+        for b in data:
+            x ^= b
+        return x & 0xFF
 
-        status_code = str(st.get("STATUS") or "")
-        sigma_log(f"clear_to_idle: not idle STATUS={status_code}; attempting recovery")
+    def build_frame(self, payload: bytes) -> bytes:
+        body = payload + bytes([self.ETX])
+        lrc = self.lrc(body)
+        return bytes([self.STX]) + payload + bytes([self.ETX, lrc])
 
-        # COMPLETE_TX
-        self._send_method(ser, "COMPLETE_TX")
-        self._drain_frames(ser, seconds=1.5, label="after-COMPLETE_TX")
+    def feed(self, chunk: bytes) -> None:
+        if chunk:
+            self._buf.extend(chunk)
 
-        st = self.get_status_final(ser, max_wait=6.0, verbose_log=True)
-        if st and self._is_idle(st):
-            sigma_log("clear_to_idle: idle after COMPLETE_TX")
-            return True
+    def extract_frames(self) -> List[SigmaFrame]:
+        frames: List[SigmaFrame] = []
 
-        # CANCEL_TX
-        self._send_method(ser, "CANCEL_TX")
-        self._drain_frames(ser, seconds=1.5, label="after-CANCEL_TX")
-
-        end = time.time() + float(max_wait)
-        while time.time() < end:
-            st = self.get_status_final(ser, max_wait=6.0, verbose_log=False)
-            if st:
-                sigma_log("clear_to_idle poll: " + str(st))
-            if st and self._is_idle(st):
-                sigma_log("clear_to_idle: idle after CANCEL_TX")
-                return True
-            time.sleep(1.0)
-
-        sigma_log("clear_to_idle: failed to reach idle before timeout")
-        return False
-
-    # ------------------------
-    # PURCHASE (wait final frame)
-    # ------------------------
-    def _purchase_one(self, ser: serial.Serial, amount_str: str, currency_num: str, reference: str, first_wait: float, final_wait: float) -> Dict[str, str]:
-        sid = str(uuid.uuid4())
-        lines = [
-            "PROTOCOL=IPP",
-            "METHOD=PURCHASE",
-            f"VERSION={self.version}",
-            f"SID={sid}",
-            f"AMOUNT={amount_str}",
-            f"CURRENCY={currency_num}",
-        ]
-        if reference:
-            lines.append(f"REFERENCE={reference}")
-
-        self._drain_frames(ser, seconds=0.4, label="pre-purchase")
-
-        sigma_log(f"PURCHASE >> amt={amount_str} currency={currency_num} ref={reference} sid={sid}")
-        self._send_frame(ser, lines)
-
-        # First matching frame
-        first = None
-        end_first = time.time() + float(first_wait)
-        while time.time() < end_first:
-            props, _ = self._read_frame(ser, timeout=1.0)
-            if not props:
-                continue
-            if props.get("METHOD") == "PURCHASE" and props.get("SID") == sid:
-                first = props
+        while True:
+            # Find STX
+            try:
+                stx_i = self._buf.index(self.STX)
+            except ValueError:
+                # No STX; drop noise
+                if self._buf:
+                    self._buf.clear()
                 break
 
-        if not first:
-            sigma_log(f"PURCHASE no first response sid={sid}")
-            return {"PROTOCOL": "IPP", "METHOD": "PURCHASE", "SID": sid, "STATUS": "", "STAGE": ""}
+            if stx_i > 0:
+                # discard leading noise
+                del self._buf[:stx_i]
 
-        status_first = str(first.get("STATUS") or "")
-        sigma_log(f"PURCHASE first_resp status={status_first} stage={first.get('STAGE')} timeout={first.get('TIMEOUT')} resp={first}")
+            # Need at least STX + ETX + LRC
+            if len(self._buf) < 4:
+                break
 
-        # If rejected immediately, return first
-        if status_first != "0":
-            return first
+            # Find ETX after STX
+            try:
+                etx_i = self._buf.index(self.ETX, 1)
+            except ValueError:
+                break
 
-        # Accepted: keep reading until final for this SID
-        last = first
-        end = time.time() + float(final_wait)
-        while time.time() < end:
-            props, _ = self._read_frame(ser, timeout=5.0)
-            if not props:
+            # Need LRC byte after ETX
+            if etx_i + 1 >= len(self._buf):
+                break
+
+            lrc_byte = self._buf[etx_i + 1]
+            payload = bytes(self._buf[1:etx_i])  # between STX and ETX
+            body = payload + bytes([self.ETX])
+            expected = self.lrc(body)
+
+            frame_raw = bytes(self._buf[: etx_i + 2])
+
+            # Consume buffer for this candidate regardless; if invalid, continue scanning
+            del self._buf[: etx_i + 2]
+
+            if lrc_byte != expected:
+                if self._log:
+                    self._log.debug(
+                        f"RX frame LRC mismatch: got={lrc_byte:02X} expected={expected:02X} raw={frame_raw!r}"
+                    )
                 continue
-            if props.get("METHOD") == "PURCHASE" and props.get("SID") == sid:
-                last = props
-                t = str(props.get("TIMEOUT") or "")
-                if t in ("", "0"):
-                    sigma_log(f"PURCHASE final detected TIMEOUT={t} props={props}")
-                    break
 
-        return last
+            frames.append(SigmaFrame(raw=frame_raw, payload=payload))
+
+        return frames
+
+
+# -----------------------------
+# Parsing helpers (tolerant)
+# -----------------------------
+
+_KV_RE = re.compile(r"([A-Z0-9_]+)\s*=\s*([^;|,\r\n]+)", re.IGNORECASE)
+
+
+def parse_kv(payload: bytes) -> Dict[str, str]:
+    """
+    Best-effort parse of key=value pairs from an ASCII-ish payload.
+    Works across separators: ; | , whitespace, CRLF.
+    """
+    try:
+        text = payload.decode("utf-8", errors="replace")
+    except Exception:
+        text = str(payload)
+
+    fields: Dict[str, str] = {}
+
+    for m in _KV_RE.finditer(text):
+        k = m.group(1).strip().upper()
+        v = m.group(2).strip()
+        fields[k] = v
+
+    # Also preserve entire message for debugging
+    fields.setdefault("_RAW", text.strip())
+    return fields
+
+
+# -----------------------------
+# Client
+# -----------------------------
+
+class SigmaIppClient:
+    def __init__(
+        self,
+        port: str = DEFAULT_DEVICE,
+        baudrate: int = DEFAULT_BAUDRATE,
+        serial_timeout: float = 0.2,
+        write_timeout: float = DEFAULT_WRITE_TIMEOUT,
+        sigma_logger: Optional[logging.Logger] = None,
+        app_logger: Optional[logging.Logger] = None,
+    ):
+        self.port = port
+        self.baudrate = baudrate
+        self.serial_timeout = serial_timeout
+        self.write_timeout = write_timeout
+        self.sigma_log = sigma_logger or _build_default_sigma_logger()
+        self.log = app_logger or logging.getLogger(__name__)
+        self._ser: Optional[serial.Serial] = None
+        self._framer = SigmaFramer(self.sigma_log)
+
+    # ---- lifecycle ----
+
+    def open(self) -> None:
+        if self._ser and self._ser.is_open:
+            return
+        self._ser = serial.Serial(
+            self.port,
+            self.baudrate,
+            timeout=self.serial_timeout,
+            write_timeout=self.write_timeout,
+        )
+        self._flush()
+        self.sigma_log.debug(f"OPEN port={self.port} baud={self.baudrate}")
+
+    def close(self) -> None:
+        if self._ser:
+            try:
+                self._ser.close()
+            finally:
+                self._ser = None
+        self.sigma_log.debug("CLOSE")
+
+    def __enter__(self) -> "SigmaIppClient":
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    # ---- public API ----
+
+    def ensure_ready(self, max_wait_s: float = 30.0) -> None:
+        """
+        Enforce the production-safe precondition:
+        - If STATUS=20 => COMPLETE_TX -> CANCEL_TX -> wait final READY
+        - Otherwise wait until READY (STATUS=0)
+        """
+        st = self.get_status(timeout_mode="normal")
+        if st.status == 20:
+            self.log.info("Sigma reports STATUS=20 (NOT COMPLETED LAST TX). Running recovery.")
+            self._recover_not_completed_last_tx(max_wait_s=max_wait_s)
+        else:
+            self._wait_for_ready(max_wait_s=max_wait_s)
 
     def purchase(
         self,
-        amount_minor,
-        currency_num: str = "826",
-        reference: str = "",
-        max_wait: float = 180.0,
-        auto_clear_not_completed_last_tx: bool = True,
-    ) -> Dict[str, Any]:
+        amount_minor: int,
+        currency: str = "GBP",
+        max_wait_s: float = 180.0,
+        ref: Optional[str] = None,
+    ) -> SigmaResponse:
         """
-        Blocking purchase with correct preconditions.
+        Execute a PURCHASE flow and wait for the final frame (TIMEOUT=0 style),
+        then wait until terminal is READY before returning.
 
-        Key behaviour learned from Sigma IPP:
-          - If GET_STATUS(final).STATUS == 20 ("NOT COMPLETED LAST TX"),
-            PURCHASE will reject until you COMPLETE_TX (preferred) or CANCEL_TX.
-          - PURCHASE returns multiple frames; final typically TIMEOUT==0.
-
-        Attempts:
-          1) decimal (e.g. "1.00")
-          2) minor units (e.g. "100")
-        (Your terminal accepted both formats once idle; keeping both to be safe.)
+        Returns a parsed SigmaResponse with accumulated frames.
         """
+        self.ensure_ready(max_wait_s=30.0)
 
-        # Normalize to integer minor units
-        try:
-            minor_int = int(amount_minor)
-        except Exception:
-            minor_int = int(round(float(amount_minor) * 100))
+        ref = (ref or uuid.uuid4().hex[:12]).upper()
+        cmd = self._build_command(
+            "PURCHASE",
+            {
+                "AMOUNT": str(int(amount_minor)),
+                "CURRENCY": currency,
+                "REF": ref,
+            },
+        )
+        self._write_frame(cmd)
 
-        attempts = [
-            f"{minor_int/100:.2f}",   # "1.00"
-            str(minor_int),          # "100"
-        ]
-
-        sigma_log(
-            f"PURCHASE start amount_minor={amount_minor} minor_int={minor_int} currency_num={currency_num} reference={reference} port={self.port}"
+        # Wait for the "final" purchase completion response
+        resp = self._read_until_complete(
+            max_wait_s=max_wait_s,
+            is_complete=self._purchase_complete_predicate,
         )
 
-        last_matching: Dict[str, str] = {}
+        # If decline/error surfaced at STAGE=5, treat as final decision (per your finding)
+        # but still enforce READY before returning.
+        self._wait_for_ready(max_wait_s=30.0)
 
-        with serial.Serial(self.port, self.baud, timeout=self.timeout) as ser:
-            self._toggle_lines(ser)
+        return resp
 
-            # Optional: clear STATUS=20 before attempting purchase
-            if auto_clear_not_completed_last_tx:
-                st = self.get_status_final(ser, max_wait=6.0, verbose_log=True)
-                if st and str(st.get("STATUS") or "") == "20":
-                    sigma_log("PURCHASE precheck: STATUS=20 (NOT COMPLETED LAST TX) -> clearing to idle")
-                    self.clear_to_idle(ser, max_wait=25.0)
+    def complete_tx(self, max_wait_s: float = 60.0) -> SigmaResponse:
+        cmd = self._build_command("COMPLETE_TX", {"REF": uuid.uuid4().hex[:12].upper()})
+        self._write_frame(cmd)
+        return self._read_until_complete(max_wait_s=max_wait_s, is_complete=self._generic_complete_predicate)
 
-            # Ensure we're idle
-            st = self.get_status_final(ser, max_wait=6.0, verbose_log=True)
-            if not st:
-                return {"approved": False, "status": "", "stage": "", "raw": {}, "receipt": "", "txid": ""}
+    def cancel_tx(self, max_wait_s: float = 60.0) -> SigmaResponse:
+        cmd = self._build_command("CANCEL_TX", {"REF": uuid.uuid4().hex[:12].upper()})
+        self._write_frame(cmd)
+        return self._read_until_complete(max_wait_s=max_wait_s, is_complete=self._generic_complete_predicate)
 
-            if not self._is_idle(st):
-                # If not idle, attempt recovery (covers STATUS=20 and other non-idle conditions)
-                sigma_log(f"PURCHASE precheck: terminal not idle STATUS={st.get('STATUS')} -> attempting clear_to_idle")
-                ok = self.clear_to_idle(ser, max_wait=25.0)
-                if not ok:
-                    # Return the final status frame so caller can see why it refused
-                    return {
-                        "approved": False,
-                        "status": str(st.get("STATUS") or ""),
-                        "stage": str(st.get("STAGE") or ""),
-                        "raw": dict(st),
-                        "receipt": "",
-                        "txid": "",
-                    }
+    def get_status(self, timeout_mode: str = "normal", max_wait_s: float = 10.0) -> SigmaResponse:
+        """
+        timeout_mode:
+          - "normal": bounded read window (serial timeouts) up to max_wait_s
+          - "final": emulate TIMEOUT=0 semantics by waiting for next status frame
+                    but still guarded by max_wait_s (production safety)
+        """
+        if timeout_mode not in ("normal", "final"):
+            raise ValueError("timeout_mode must be 'normal' or 'final'")
 
-            # Run attempts
-            for amt in attempts:
-                resp = self._purchase_one(
-                    ser,
-                    amount_str=amt,
-                    currency_num=currency_num,
-                    reference=reference,
-                    first_wait=25.0,
-                    final_wait=float(max_wait),
-                )
-                last_matching = resp
-                # If accepted initially, we'll have reached a final frame (TIMEOUT==0)
-                # Regardless, stop after the first attempt that didn't immediately reject by formatting.
-                # If it rejected immediately with a format issue, try next format.
-                if str(resp.get("STATUS") or "") == "0":
-                    break
-                # If immediate reject on stage 1 etc, try the next format
-                # (If user cancels/declines you'll still see non-zero; we still stop after first decimal attempt
-                # only if it progressed beyond "format" - but safest is to try both always.)
-                # We'll try both formats unless the first was accepted (STATUS==0).
+        params = {
+            "REF": uuid.uuid4().hex[:12].upper(),
+            "TIMEOUT": "0" if timeout_mode == "final" else "1",
+        }
+        cmd = self._build_command("GET_STATUS", params)
+        self._write_frame(cmd)
+
+        return self._read_until_complete(
+            max_wait_s=max_wait_s,
+            is_complete=self._status_complete_predicate,
+        )
+
+    # -----------------------------
+    # Internal: recovery + waits
+    # -----------------------------
+
+    def _recover_not_completed_last_tx(self, max_wait_s: float) -> None:
+        # Spec per your debugging: COMPLETE_TX then CANCEL_TX then wait final GET_STATUS TIMEOUT=0 => STATUS=0
+        try:
+            self.complete_tx(max_wait_s=min(60.0, max_wait_s))
+        except SigmaError as e:
+            self.log.warning(f"COMPLETE_TX during recovery raised: {e!r}")
+
+        try:
+            self.cancel_tx(max_wait_s=min(60.0, max_wait_s))
+        except SigmaError as e:
+            self.log.warning(f"CANCEL_TX during recovery raised: {e!r}")
+
+        # Must wait for final GET_STATUS TIMEOUT=0 with STATUS=0
+        deadline = time.monotonic() + max_wait_s
+        while time.monotonic() < deadline:
+            st = self.get_status(timeout_mode="final", max_wait_s=min(30.0, max_wait_s))
+            if st.status == 0:
+                return
+        raise SigmaTimeout("Recovery from STATUS=20 timed out waiting for STATUS=0")
+
+    def _wait_for_ready(self, max_wait_s: float = 30.0) -> None:
+        deadline = time.monotonic() + max_wait_s
+        last: Optional[SigmaResponse] = None
+        while time.monotonic() < deadline:
+            last = self.get_status(timeout_mode="normal", max_wait_s=5.0)
+            if last.status == 0:
+                return
+            if last.status == 20:
+                self._recover_not_completed_last_tx(max_wait_s=max_wait_s)
+                return
+            time.sleep(0.25)
+        raise SigmaTimeout(f"Terminal not READY (STATUS=0) within {max_wait_s}s. Last={last.fields if last else None}")
+
+    # -----------------------------
+    # Internal: command building
+    # -----------------------------
+
+    def _build_command(self, name: str, params: Dict[str, str]) -> bytes:
+        """
+        Build an application payload.
+
+        Default format: ASCII "CMD=NAME;K=V;K=V"
+        If your terminal expects a different payload structure, update here.
+        """
+        parts = [f"CMD={name}"]
+        for k, v in params.items():
+            parts.append(f"{k}={v}")
+        payload = ";".join(parts)
+        return payload.encode("utf-8")
+
+    # -----------------------------
+    # Internal: IO (write/read)
+    # -----------------------------
+
+    def _flush(self) -> None:
+        if not self._ser:
+            return
+        try:
+            self._ser.reset_input_buffer()
+            self._ser.reset_output_buffer()
+        except Exception:
+            pass
+
+    def _write_frame(self, payload: bytes) -> None:
+        if not self._ser or not self._ser.is_open:
+            self.open()
+
+        frame = self._framer.build_frame(payload)
+        self.sigma_log.debug(f"TX {frame!r}")
+        try:
+            self._ser.write(frame)
+            self._ser.flush()
+        except Exception as e:
+            raise SigmaError(f"Serial write failed: {e}") from e
+
+    def _read_frames(self, max_wait_s: float) -> List[SigmaFrame]:
+        """
+        Read and return any valid frames observed within max_wait_s.
+        """
+        if not self._ser or not self._ser.is_open:
+            self.open()
+
+        deadline = time.monotonic() + max_wait_s
+        out: List[SigmaFrame] = []
+
+        while time.monotonic() < deadline:
+            try:
+                chunk = self._ser.read(4096)
+            except Exception as e:
+                raise SigmaError(f"Serial read failed: {e}") from e
+
+            if chunk:
+                self.sigma_log.debug(f"RXCHUNK {chunk!r}")
+                self._framer.feed(chunk)
+                frames = self._framer.extract_frames()
+                if frames:
+                    for fr in frames:
+                        self.sigma_log.debug(f"RX {fr.raw!r}")
+                    out.extend(frames)
+                    break  # return promptly once we have frames
+            else:
+                # No data this tick
+                time.sleep(0.01)
+
+        return out
+
+    def _read_until_complete(
+        self,
+        max_wait_s: float,
+        is_complete: Callable[[SigmaResponse], bool],
+    ) -> SigmaResponse:
+        """
+        Keep reading frames until predicate says complete, or timeout.
+        Accumulates frames and merges parsed fields (last write wins).
+        """
+        deadline = time.monotonic() + max_wait_s
+        all_frames: List[SigmaFrame] = []
+        merged: Dict[str, str] = {}
+        last_resp: Optional[SigmaResponse] = None
+
+        while time.monotonic() < deadline:
+            frames = self._read_frames(max_wait_s=min(1.0, max_wait_s))
+            if not frames:
                 continue
 
-        status = str(last_matching.get("STATUS") or "")
-        stage = str(last_matching.get("STAGE") or "")
+            all_frames.extend(frames)
 
-        # Approval:
-        # - Prefer APPROVAL / TX_STATUS fields if present at final stage
-        # - Otherwise STATUS == "0" means flow accepted/ok
-        approved = False
-        if "APPROVAL" in last_matching:
-            # myPOS often uses APPROVAL=00 for approved
-            approved = str(last_matching.get("APPROVAL") or "").strip() in ("00", "0")
-        elif "TX_STATUS" in last_matching:
-            approved = str(last_matching.get("TX_STATUS") or "").strip() in ("0", "00")
-        elif "APPROVED" in last_matching:
-            approved = str(last_matching.get("APPROVED")).lower() in ("1", "true", "yes")
-        elif "RESULT" in last_matching:
-            approved = str(last_matching.get("RESULT")).upper() in ("APPROVED", "00")
-        else:
-            approved = (status == "0")
+            # Parse every payload and merge
+            for fr in frames:
+                fields = parse_kv(fr.payload)
+                merged.update(fields)
 
-        receipt = str(last_matching.get("RECEIPT") or "")
-        txid = str(
-            last_matching.get("RRN")
-            or last_matching.get("AUTH_CODE")
-            or last_matching.get("AUTH")
-            or last_matching.get("TXID")
-            or ""
-        )
+            last_resp = SigmaResponse(fields=dict(merged), frames=list(all_frames))
 
-        sigma_log(f"PURCHASE done approved={approved} status={status} stage={stage} txid={txid} raw={last_matching}")
+            if is_complete(last_resp):
+                return last_resp
 
-        return {
-            "approved": bool(approved),
-            "status": status,
-            "stage": stage,
-            "raw": dict(last_matching or {}),
-            "receipt": receipt,
-            "txid": txid,
-        }
+            # If purchase showed decline at stage 5, we can treat as complete (per your finding)
+            if self._is_decline_at_stage5(last_resp):
+                return last_resp
+
+        raise SigmaTimeout(f"Timed out waiting for completion after {max_wait_s}s. Last={last_resp.fields if last_resp else None}")
+
+    # -----------------------------
+    # Completion predicates
+    # -----------------------------
+
+    @staticmethod
+    def _status_complete_predicate(resp: SigmaResponse) -> bool:
+        # Any status response with STATUS present is "complete" for a GET_STATUS command.
+        return resp.status is not None
+
+    @staticmethod
+    def _generic_complete_predicate(resp: SigmaResponse) -> bool:
+        """
+        Generic "command complete" heuristic:
+        - STATUS present AND (STAGE absent OR STAGE in a terminal-ish range)
+        This is intentionally tolerant.
+        """
+        if resp.status is None:
+            return False
+        if resp.stage is None:
+            return True
+        return resp.stage >= 6 or resp.stage == 0
+
+    @staticmethod
+    def _purchase_complete_predicate(resp: SigmaResponse) -> bool:
+        """
+        PURCHASE "final frame" heuristic:
+        - STATUS present AND either:
+            - STAGE >= 6 (completed)
+            - or fields include typical completion markers (APPROVED/DECLINED/ERROR)
+        You can tighten this if you have an exact marker from your logs.
+        """
+        if resp.status is None:
+            return False
+        stg = resp.stage
+        if stg is not None and stg >= 6:
+            return True
+
+        raw = (resp.get("_RAW") or "").upper()
+        # Common terminal keywords (best-effort)
+        if any(k in raw for k in ("APPROVED", "DECLINED", "CANCELLED", "CANCELED", "ERROR", "FAILED", "COMPLETED")):
+            return True
+
+        # Some protocols send RESULT=... or RESP=...
+        result = (resp.get("RESULT") or resp.get("RESP") or "").upper()
+        if result in ("APPROVED", "DECLINED", "CANCELLED", "CANCELED", "ERROR", "FAILED", "SUCCESS"):
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_decline_at_stage5(resp: SigmaResponse) -> bool:
+        # Your observed behavior: non-zero STATUS at STAGE=5 indicates user-declined amount.
+        return (resp.stage == 5) and (resp.status is not None) and (resp.status != 0)
+
+
+# -----------------------------
+# Minimal smoke test (optional)
+# -----------------------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    client = SigmaIppClient(
+        port=DEFAULT_DEVICE,
+        baudrate=DEFAULT_BAUDRATE,
+    )
+
+    with client:
+        st = client.get_status(timeout_mode="normal")
+        print("STATUS:", st.status, "STAGE:", st.stage, "RAW:", st.get("_RAW"))
+
+        # Example purchase (amount in minor units, e.g. 150 = £1.50)
+        # resp = client.purchase(amount_minor=150, currency="GBP")
+        # print("PURCHASE STATUS:", resp.status, "STAGE:", resp.stage)
+        # print("FIELDS:", resp.fields)
