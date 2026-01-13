@@ -11,9 +11,14 @@ Wire format (CONFIRMED by your working sigma_purchase.py):
 
 Lifecycle (CONFIRMED by your debugging):
 - If GET_STATUS(final).STATUS == 20 => recover:
-    COMPLETE_TX -> CANCEL_TX -> wait until GET_STATUS(final).STATUS == 0
-  (REVERSAL is included as an optional last resort because your tester used it and some firmware needs it)
+    COMPLETE_TX -> CANCEL_TX -> poll until STATUS == 0
+  (REVERSAL included as last resort because your tester used it; some firmware needs it)
 - PURCHASE: wait for first matching frame; if STATUS != 0 return it; else continue until final frame.
+
+Important robustness fix:
+- Some CDC-ACM devices / drivers reject DTR/RTS ioctls during open().
+  PySerial can throw BrokenPipeError inside _update_dtr_state().
+  We open with dsrdtr=False and rtscts=False and we NEVER fail if DTR/RTS toggles fail.
 
 Public API:
 - SigmaIppClient.purchase(amount_minor:int, currency_num:str="826", reference:str="")
@@ -21,7 +26,7 @@ Public API:
 - SigmaIppClient.ensure_idle()
 
 Compatibility:
-- Provides SigmaIPP class with the signature your pi_api.py used previously.
+- Provides SigmaIPP class with the signature your pi_api.py previously used.
 """
 
 from __future__ import annotations
@@ -125,9 +130,10 @@ def _timeout_is_final(props: Dict[str, str]) -> bool:
     return t in ("", "0")
 
 
-def _toggle_lines(ser: serial.Serial) -> None:
+def _toggle_lines_safe(ser: serial.Serial) -> None:
     """
     Some CDC-ACM devices respond more reliably after DTR/RTS toggles.
+    But some drivers/devices reject these ioctls, so this must never raise.
     """
     try:
         ser.dtr = False
@@ -137,7 +143,7 @@ def _toggle_lines(ser: serial.Serial) -> None:
         ser.rts = True
         time.sleep(0.2)
     except Exception:
-        pass
+        return
 
 
 # -----------------------------
@@ -165,13 +171,26 @@ class SigmaIppClient:
     def open(self) -> None:
         if self._ser and self._ser.is_open:
             return
-        self._ser = serial.Serial(self.port, self.baudrate, timeout=self.read_timeout)
-        _toggle_lines(self._ser)
+
+        # IMPORTANT: Disable modem control during open.
+        # Some CDC-ACM devices/drivers can throw BrokenPipeError while setting DTR.
+        self._ser = serial.Serial(
+            self.port,
+            self.baudrate,
+            timeout=self.read_timeout,
+            rtscts=False,
+            dsrdtr=False,
+        )
+
+        # Try toggling lines, but never fail if unsupported.
+        _toggle_lines_safe(self._ser)
+
         try:
             self._ser.reset_input_buffer()
             self._ser.reset_output_buffer()
         except Exception:
             pass
+
         self.log.debug(f"OPEN port={self.port} baud={self.baudrate} version={self.version}")
 
     def close(self) -> None:
@@ -308,7 +327,7 @@ class SigmaIppClient:
         """
         deadline = time.time() + float(max_total_wait)
 
-        # initial drain helps remove stale chatter
+        # drain helps remove stale chatter
         self._drain(seconds=1.0, label="pre-ensure-idle")
 
         st = self.get_status_final(max_wait=6.0)
@@ -372,7 +391,7 @@ class SigmaIppClient:
         """
         PURCHASE using amount in minor units (e.g. 100 for £1.00).
         Returns dict compatible with your existing API expectations:
-          approved(bool), status(str), stage(str), timeout(str), raw(str/dict), sid(str)
+          approved(bool), status(str), stage(str), timeout(str), raw(dict), sid(str)
         """
         if not self._ser or not self._ser.is_open:
             self.open()
@@ -402,8 +421,7 @@ class SigmaIppClient:
         timeout = str(props.get("TIMEOUT") or "")
 
         approved = (status == "0")
-        # per your finding: user-declined amounts may show non-zero STATUS at STAGE=5
-        # we just return as declined; caller/UI decides.
+
         return {
             "approved": approved,
             "status": status,
