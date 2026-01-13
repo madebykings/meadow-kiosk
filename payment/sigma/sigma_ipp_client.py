@@ -15,10 +15,11 @@ Lifecycle (CONFIRMED by your debugging):
   (REVERSAL included as last resort because your tester used it; some firmware needs it)
 - PURCHASE: wait for first matching frame; if STATUS != 0 return it; else continue until final frame.
 
-Important robustness fix:
-- Some CDC-ACM devices / drivers reject DTR/RTS ioctls during open().
-  PySerial can throw BrokenPipeError inside _update_dtr_state().
-  We open with dsrdtr=False and rtscts=False and we NEVER fail if DTR/RTS toggles fail.
+PySerial robustness:
+- Some builds/devices throw BrokenPipeError inside serialposix._update_dtr_state() while opening
+- Some pyserial builds do NOT support do_not_open=True
+- We open by constructing Serial(port=None, ...) then setting .port and calling .open()
+  with a temporary patch around _update_dtr_state() to ignore errno 32.
 
 Public API:
 - SigmaIppClient.purchase(amount_minor:int, currency_num:str="826", reference:str="")
@@ -26,7 +27,7 @@ Public API:
 - SigmaIppClient.ensure_idle()
 
 Compatibility:
-- Provides SigmaIPP class with the signature your pi_api.py previously used.
+- Provides SigmaIPP class with the signature your pi_api.py can use if desired.
 """
 
 from __future__ import annotations
@@ -146,6 +147,61 @@ def _toggle_lines_safe(ser: serial.Serial) -> None:
         return
 
 
+def _open_serial_safely(port: str, baudrate: int, timeout: float) -> serial.Serial:
+    """
+    Open Serial without relying on do_not_open=True (not available in some pyserial builds),
+    and avoid fatal BrokenPipeError from DTR ioctl by temporarily patching _update_dtr_state.
+    """
+    # Create without opening by passing port=None
+    ser = serial.Serial(
+        port=None,
+        baudrate=baudrate,
+        timeout=timeout,
+        rtscts=False,
+        dsrdtr=False,
+    )
+    ser.port = port
+
+    # Patch serialposix.Serial._update_dtr_state to ignore errno 32 during open
+    orig = None
+    patched = False
+    try:
+        try:
+            import serial.serialposix as sp  # type: ignore
+            orig = getattr(sp.Serial, "_update_dtr_state", None)
+            if orig:
+                def _safe_update_dtr_state(self_):  # type: ignore
+                    try:
+                        orig(self_)
+                    except BrokenPipeError:
+                        return
+                    except OSError as e:
+                        if getattr(e, "errno", None) == 32:
+                            return
+                        raise
+                sp.Serial._update_dtr_state = _safe_update_dtr_state  # type: ignore
+                patched = True
+        except Exception:
+            # If serialposix isn't present (non-posix), just proceed
+            pass
+
+        # Now open; if it still raises BrokenPipeError, keep going (fd often valid)
+        try:
+            ser.open()
+        except BrokenPipeError:
+            pass
+
+    finally:
+        if patched and orig:
+            try:
+                import serial.serialposix as sp  # type: ignore
+                sp.Serial._update_dtr_state = orig  # type: ignore
+            except Exception:
+                pass
+
+    return ser
+
+
 # -----------------------------
 # Client
 # -----------------------------
@@ -172,30 +228,10 @@ class SigmaIppClient:
         if self._ser and self._ser.is_open:
             return
 
-        # Create Serial object WITHOUT opening the port
-        self._ser = serial.Serial(
-            port=None,
-            baudrate=self.baudrate,
-            timeout=self.read_timeout,
-            rtscts=False,
-            dsrdtr=False,
-            do_not_open=True,
-        )
-
-        # Assign port and open explicitly
-        self._ser.port = self.port
-        try:
-            self._ser.open()
-        except BrokenPipeError:
-            # Some CDC-ACM drivers can throw here on modem-control ioctls.
-            # Continue anyway; reads/writes often still work fine.
-            pass
+        self._ser = _open_serial_safely(self.port, self.baudrate, self.read_timeout)
 
         # Best-effort line toggle — NEVER fatal
-        try:
-            _toggle_lines_safe(self._ser)
-        except Exception:
-            pass
+        _toggle_lines_safe(self._ser)
 
         try:
             self._ser.reset_input_buffer()
@@ -339,7 +375,6 @@ class SigmaIppClient:
         """
         deadline = time.time() + float(max_total_wait)
 
-        # drain helps remove stale chatter
         self._drain(seconds=1.0, label="pre-ensure-idle")
 
         st = self.get_status_final(max_wait=6.0)
@@ -355,7 +390,6 @@ class SigmaIppClient:
             self.log.debug(f"Not idle. STATUS={code}")
 
             if code == "20":
-                # 1) COMPLETE_TX
                 self._send_method("COMPLETE_TX")
                 self._drain(seconds=2.0, label="after-COMPLETE_TX")
                 time.sleep(1.0)
@@ -363,7 +397,6 @@ class SigmaIppClient:
                 if self._is_idle(st):
                     return True
 
-                # 2) CANCEL_TX
                 self._send_method("CANCEL_TX")
                 self._drain(seconds=2.0, label="after-CANCEL_TX")
                 time.sleep(1.0)
@@ -371,7 +404,6 @@ class SigmaIppClient:
                 if self._is_idle(st):
                     return True
 
-                # 3) Optional REVERSAL (some firmware needs it; your tester did it)
                 self._send_method("REVERSAL")
                 self._drain(seconds=3.0, label="after-REVERSAL")
                 time.sleep(1.0)
@@ -380,7 +412,6 @@ class SigmaIppClient:
                     return True
 
             else:
-                # Unknown non-idle code: poll a bit
                 time.sleep(1.0)
                 st = self.get_status_final(max_wait=6.0)
                 if self._is_idle(st):
@@ -402,18 +433,16 @@ class SigmaIppClient:
     ) -> Dict[str, Any]:
         """
         PURCHASE using amount in minor units (e.g. 100 for £1.00).
-        Returns dict compatible with your existing API expectations:
-          approved(bool), status(str), stage(str), timeout(str), raw(dict), sid(str)
+        Returns dict compatible with your existing API expectations.
         """
         if not self._ser or not self._ser.is_open:
             self.open()
 
-        # Drain chatter and ensure idle
         self._drain(seconds=2.0, label="pre-purchase-drain")
         if not self.ensure_idle(max_total_wait=45.0):
             raise SigmaTimeout("Terminal not idle before purchase")
 
-        amt_str = str(int(amount_minor))  # your successful test used "100" style
+        amt_str = str(int(amount_minor))
         extra = [
             f"AMOUNT={amt_str}",
             f"CURRENCY={str(currency_num)}",
@@ -449,12 +478,6 @@ class SigmaIppClient:
 # -----------------------------
 
 class SigmaIPP:
-    """
-    Backwards compatible class for existing imports:
-      SigmaIPP(port=..., baud=...)
-      .purchase(amount_minor=..., currency_num=..., reference=...)
-    """
-
     def __init__(self, port: str = DEFAULT_PORT, baud: int = DEFAULT_BAUD, version: str = DEFAULT_VERSION):
         self._client = SigmaIppClient(port=port, baudrate=baud, version=version)
 
