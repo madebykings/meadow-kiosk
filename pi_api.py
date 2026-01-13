@@ -34,6 +34,10 @@ from payment.sigma.sigma_ipp_client import SigmaIppClient
 HOST = "127.0.0.1"
 PORT = 8765
 
+# Cloudflare Tunnel injects this header on requests that reach the origin.
+# We require it for all POST endpoints (purchase/vend) to prevent public abuse.
+TUNNEL_AUTH_HEADER = "X-Meadow-Tunnel"
+TUNNEL_AUTH_SECRET = os.getenv("Mvato2025$!", "")  # set in systemd env
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
     body = json.dumps(payload).encode("utf-8")
