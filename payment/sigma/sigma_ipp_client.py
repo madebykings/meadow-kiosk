@@ -442,7 +442,9 @@ class SigmaIppClient:
         if not self.ensure_idle(max_total_wait=45.0):
             raise SigmaTimeout("Terminal not idle before purchase")
 
-        amt_str = str(int(amount_minor))
+        pounds = int(amount_minor) // 100
+        pence = int(amount_minor) % 100
+        amt_str = f"{pounds}.{pence:02d}"
         extra = [
             f"AMOUNT={amt_str}",
             f"CURRENCY={str(currency_num)}",
