@@ -169,29 +169,42 @@ class SigmaIppClient:
     # ---- lifecycle ----
 
     def open(self) -> None:
-        if self._ser and self._ser.is_open:
-            return
+    if self._ser and self._ser.is_open:
+        return
 
-        # IMPORTANT: Disable modem control during open.
-        # Some CDC-ACM devices/drivers can throw BrokenPipeError while setting DTR.
-        self._ser = serial.Serial(
-            self.port,
-            self.baudrate,
-            timeout=self.read_timeout,
-            rtscts=False,
-            dsrdtr=False,
-        )
+    # Create Serial object WITHOUT opening the port
+    self._ser = serial.Serial(
+        port=None,
+        baudrate=self.baudrate,
+        timeout=self.read_timeout,
+        rtscts=False,
+        dsrdtr=False,
+        do_not_open=True,
+    )
 
-        # Try toggling lines, but never fail if unsupported.
+    # Assign port and open explicitly
+    self._ser.port = self.port
+    try:
+        self._ser.open()
+    except BrokenPipeError:
+        # Some CDC-ACM drivers throw here even though the fd is valid
+        # Continue anyway
+        pass
+
+    # Best-effort line toggle — NEVER fatal
+    try:
         _toggle_lines_safe(self._ser)
+    except Exception:
+        pass
 
-        try:
-            self._ser.reset_input_buffer()
-            self._ser.reset_output_buffer()
-        except Exception:
-            pass
+    try:
+        self._ser.reset_input_buffer()
+        self._ser.reset_output_buffer()
+    except Exception:
+        pass
 
-        self.log.debug(f"OPEN port={self.port} baud={self.baudrate} version={self.version}")
+    self.log.debug(f"OPEN port={self.port} baud={self.baudrate} version={self.version}")
+
 
     def close(self) -> None:
         if self._ser:
