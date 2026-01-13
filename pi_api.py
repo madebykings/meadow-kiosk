@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Meadow Pi API (simple)
+"""Meadow Pi API (via Cloudflare Tunnel)
 
 Endpoints (JSON):
   POST /sigma/purchase  { amount_minor:int, currency_num:str|int, reference:str }
   POST /vend            { motor:int }
   GET  /health
+  GET  /debug/config    (shows last WP config + derived maps)
 
 Notes:
-  - Designed to sit behind Cloudflare Tunnel at https://kiosk1-pi.meadowvending.com
-  - No auth in code (for now).
+  - Binds to 127.0.0.1 only. Cloudflare Tunnel publishes it externally.
+  - No header/secret auth (per your request).
 """
 
 from __future__ import annotations
@@ -31,12 +32,11 @@ PORT = 8765
 
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
-    body = json.dumps(payload).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
         handler.send_response(code)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
-        # CORS
         handler.send_header("Access-Control-Allow-Origin", "*")
         handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         handler.send_header("Access-Control-Allow-Headers", "Content-Type")
@@ -58,7 +58,7 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
 
 
 class RuntimeState:
-    """Holds the latest WP config + live controllers."""
+    """Holds last WP config + live controllers + poll status."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -66,6 +66,19 @@ class RuntimeState:
         self._motors: Optional[MotorController] = None
         self._sigma_path: str = "/dev/sigma"
         self._sigma_baud: int = 115200
+
+        self._last_config_ok: bool = False
+        self._last_config_error: str = ""
+        self._last_config_ts: int = 0
+
+        self._derived_motor_map: Dict[int, int] = {}
+        self._derived_spin_map: Dict[int, float] = {}
+
+    def mark_poll_result(self, ok: bool, err: str = "") -> None:
+        with self._lock:
+            self._last_config_ok = bool(ok)
+            self._last_config_error = (err or "")[:2000]
+            self._last_config_ts = int(time.time())
 
     def update_from_wp(self, cfg: Dict[str, Any]) -> None:
         with self._lock:
@@ -89,10 +102,13 @@ class RuntimeState:
                 except Exception:
                     continue
 
+            self._derived_motor_map = dict(mm)
+            self._derived_spin_map = dict(sm)
+
             self._motors = MotorController(mm, sm) if mm else None
 
             payment = (cfg.get("payment") or {})
-            sigma = (payment.get("sigma") or {}) if isinstance(payment, dict) else {}
+            sigma = ((payment.get("sigma") or {}) if isinstance(payment, dict) else {})
 
             usb_path = str(sigma.get("usb_path") or "").strip()
             self._sigma_path = usb_path if usb_path else "/dev/sigma"
@@ -101,6 +117,22 @@ class RuntimeState:
                 self._sigma_baud = int(sigma.get("baud") or 115200)
             except Exception:
                 self._sigma_baud = 115200
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "last_config_ok": self._last_config_ok,
+                "last_config_error": self._last_config_error,
+                "last_config_ts": self._last_config_ts,
+                "cfg": self._cfg,
+                "derived": {
+                    "motors": self._derived_motor_map,
+                    "spin_time": self._derived_spin_map,
+                },
+                "sigma_path": self._sigma_path,
+                "sigma_baud": self._sigma_baud,
+                "motors_loaded": self._motors is not None,
+            }
 
     def get_sigma(self) -> Tuple[str, int]:
         with self._lock:
@@ -116,13 +148,17 @@ STATE = RuntimeState()
 
 def _config_poll_loop() -> None:
     prov = load_provision()
+
     while True:
         try:
             cfg = fetch_config_from_wp(prov, imei=None, timeout=8)
             if cfg:
                 STATE.update_from_wp(cfg)
-        except Exception:
-            pass
+                STATE.mark_poll_result(True, "")
+            else:
+                STATE.mark_poll_result(False, "fetch_config_from_wp returned empty cfg")
+        except Exception as e:
+            STATE.mark_poll_result(False, f"{type(e).__name__}: {e}")
         time.sleep(30)
 
 
@@ -136,14 +172,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path.startswith("/health"):
-            sigma_path, sigma_baud = STATE.get_sigma()
-            motors_ok = STATE.get_motors() is not None
+            snap = STATE.snapshot()
             return _json_response(self, 200, {
                 "ok": True,
-                "sigma_path": sigma_path,
-                "sigma_baud": sigma_baud,
-                "motors_loaded": motors_ok,
+                "sigma_path": snap["sigma_path"],
+                "sigma_baud": snap["sigma_baud"],
+                "motors_loaded": snap["motors_loaded"],
+                "last_config_ok": snap["last_config_ok"],
+                "last_config_ts": snap["last_config_ts"],
+                "last_config_error": snap["last_config_error"],
             })
+
+        if self.path.startswith("/debug/config"):
+            return _json_response(self, 200, STATE.snapshot())
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
@@ -176,6 +217,7 @@ class Handler(BaseHTTPRequestHandler):
         for port in port_candidates:
             if not port or not os.path.exists(port):
                 continue
+
             try:
                 with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
                     r = sigma.purchase(
@@ -237,9 +279,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    t = threading.Thread(target=_config_poll_loop, daemon=True)
-    t.start()
-
+    threading.Thread(target=_config_poll_loop, daemon=True).start()
     httpd = HTTPServer((HOST, PORT), Handler)
     print(f"[pi_api] listening on http://{HOST}:{PORT}")
     httpd.serve_forever()
