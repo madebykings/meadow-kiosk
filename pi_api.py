@@ -145,6 +145,12 @@ def _config_poll_loop() -> None:
             pass
         time.sleep(30)
 
+def _require_tunnel_auth(handler: BaseHTTPRequestHandler) -> bool:
+    if not TUNNEL_AUTH_SECRET:
+        # Fail closed. If you prefer fail-open during rollout, change to `return True`.
+        return False
+    got = (handler.headers.get(TUNNEL_AUTH_HEADER) or "").strip()
+    return got == TUNNEL_AUTH_SECRET
 
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
@@ -168,13 +174,17 @@ class Handler(BaseHTTPRequestHandler):
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
-        if self.path.startswith("/sigma/purchase"):
-            return self._handle_sigma_purchase()
+      # Lock down POST endpoints to only traffic that came through Cloudflare Tunnel.
+      if not _require_tunnel_auth(self):
+        return _json_response(self, 403, {"ok": False, "error": "forbidden"})
 
-        if self.path.startswith("/vend"):
-            return self._handle_vend()
+      if self.path.startswith("/sigma/purchase"):
+        return self._handle_sigma_purchase()
 
-        return _json_response(self, 404, {"ok": False, "error": "not_found"})
+      if self.path.startswith("/vend"):
+        return self._handle_vend()
+
+      return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def _handle_sigma_purchase(self) -> None:
         data = _read_json(self)
