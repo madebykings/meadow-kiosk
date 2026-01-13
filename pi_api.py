@@ -30,9 +30,19 @@ from payment.sigma.sigma_ipp_client import SigmaIppClient
 HOST = "127.0.0.1"
 PORT = 8765
 
-# Cloudflare Tunnel should inject this header on requests that reach the origin.
+# Cloudflare Tunnel injects this header on requests that reach the origin.
+# We require it for all POST endpoints (purchase/vend) to prevent public abuse.
 TUNNEL_AUTH_HEADER = os.getenv("MEADOW_TUNNEL_HEADER", "X-Meadow-Tunnel")
-TUNNEL_AUTH_SECRET = os.getenv("MEADOW_TUNNEL_SECRET", "")
+TUNNEL_AUTH_SECRET = os.getenv("MEADOW_TUNNEL_SECRET", "")  # set in systemd env / env file
+
+
+def _require_tunnel_auth(handler: BaseHTTPRequestHandler) -> bool:
+    # Fail closed if not configured
+    if not TUNNEL_AUTH_SECRET:
+        return False
+    got = (handler.headers.get(TUNNEL_AUTH_HEADER) or "").strip()
+    return got == TUNNEL_AUTH_SECRET
+
 
 # During rollout, you can set MEADOW_TUNNEL_FAIL_OPEN=1 to avoid blocking POSTs
 FAIL_OPEN = (os.getenv("MEADOW_TUNNEL_FAIL_OPEN", "0").strip() == "1")
