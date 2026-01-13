@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Meadow Pi Local API
+"""Meadow Pi API (behind Cloudflare Tunnel)
 
 Endpoints (JSON):
   POST /sigma/purchase  { amount_minor:int, currency_num:str|int, reference:str }
@@ -8,7 +8,8 @@ Endpoints (JSON):
 
 Security:
   - Intended to be exposed via Cloudflare Tunnel.
-  - Require a secret header for ALL POST endpoints to prevent public abuse.
+  - Requires a secret header for ALL POST endpoints by default.
+  - During rollout, set MEADOW_TUNNEL_FAIL_OPEN=1 to avoid blocking POSTs.
 """
 
 from __future__ import annotations
@@ -31,20 +32,17 @@ HOST = "127.0.0.1"
 PORT = 8765
 
 # Cloudflare Tunnel injects this header on requests that reach the origin.
-# We require it for all POST endpoints (purchase/vend) to prevent public abuse.
-TUNNEL_AUTH_HEADER = os.getenv("MEADOW_TUNNEL_HEADER", "X-Meadow-Tunnel")
-TUNNEL_AUTH_SECRET = os.getenv("MEADOW_TUNNEL_SECRET", "")  # set in systemd env / env file
+# Your cloudflared config.yml sets it via:
+# originRequest:
+#   httpHeader:
+#     X-Meadow-Tunnel: "Mvato2025$!"
+TUNNEL_AUTH_HEADER = os.getenv("MEADOW_TUNNEL_HEADER", "X-Meadow-Tunnel").strip()
 
+# Store secret in ENV (do NOT hardcode in repo)
+# e.g. export MEADOW_TUNNEL_SECRET='Mvato2025$!'
+TUNNEL_AUTH_SECRET = os.getenv("MEADOW_TUNNEL_SECRET", "")
 
-def _require_tunnel_auth(handler: BaseHTTPRequestHandler) -> bool:
-    # Fail closed if not configured
-    if not TUNNEL_AUTH_SECRET:
-        return False
-    got = (handler.headers.get(TUNNEL_AUTH_HEADER) or "").strip()
-    return got == TUNNEL_AUTH_SECRET
-
-
-# During rollout, you can set MEADOW_TUNNEL_FAIL_OPEN=1 to avoid blocking POSTs
+# During rollout, allow POSTs even if secret not configured / header missing
 FAIL_OPEN = (os.getenv("MEADOW_TUNNEL_FAIL_OPEN", "0").strip() == "1")
 
 
@@ -73,6 +71,23 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
         return json.loads(raw.decode("utf-8"))
     except Exception:
         return {}
+
+
+def _require_tunnel_auth(handler: BaseHTTPRequestHandler) -> bool:
+    """
+    Require a shared secret in a header for POST endpoints.
+
+    - If MEADOW_TUNNEL_SECRET is not set:
+        - FAIL_OPEN=1 => allow
+        - else => block
+    - If MEADOW_TUNNEL_SECRET is set:
+        - header must match exactly
+    """
+    if not TUNNEL_AUTH_SECRET:
+        return True if FAIL_OPEN else False
+
+    got = (handler.headers.get(TUNNEL_AUTH_HEADER) or "").strip()
+    return hmac.compare_digest(got, TUNNEL_AUTH_SECRET)
 
 
 class RuntimeState:
@@ -110,7 +125,7 @@ class RuntimeState:
             self._motors = MotorController(mm, sm) if mm else None
 
             payment = (cfg.get("payment") or {})
-            sigma = ((payment.get("sigma") or {}) if isinstance(payment, dict) else {})
+            sigma = (payment.get("sigma") or {}) if isinstance(payment, dict) else {}
 
             usb_path = str(sigma.get("usb_path") or "").strip()
             self._sigma_path = usb_path if usb_path else "/dev/sigma"
@@ -144,19 +159,9 @@ def _config_poll_loop() -> None:
         time.sleep(30)
 
 
-def _require_tunnel_auth(handler: BaseHTTPRequestHandler) -> bool:
-    # If no secret configured, either fail closed (default) or fail open if explicitly allowed.
-    if not TUNNEL_AUTH_SECRET:
-        if FAIL_OPEN:
-            return True
-        return False
-
-    got = (handler.headers.get(TUNNEL_AUTH_HEADER) or "").strip()
-    return hmac.compare_digest(got, TUNNEL_AUTH_SECRET)
-
-
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
+        # CORS preflight must never be blocked
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
@@ -172,16 +177,24 @@ class Handler(BaseHTTPRequestHandler):
                 "sigma_path": sigma_path,
                 "sigma_baud": sigma_baud,
                 "motors_loaded": motors_ok,
+                "tunnel_auth": {
+                    "header": TUNNEL_AUTH_HEADER,
+                    "secret_set": bool(TUNNEL_AUTH_SECRET),
+                    "fail_open": FAIL_OPEN,
+                }
             })
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
-        # Lock down POST endpoints to only traffic that came through Cloudflare Tunnel
+        # Lock down POST endpoints to only traffic that includes our tunnel-secret header
         if not _require_tunnel_auth(self):
-            # debug: show what we received (header name only + length)
             got = (self.headers.get(TUNNEL_AUTH_HEADER) or "")
-            print(f"[pi_api] FORBIDDEN {self.path} header={TUNNEL_AUTH_HEADER} len={len(got)} secret_set={bool(TUNNEL_AUTH_SECRET)}")
+            print(
+                f"[pi_api] FORBIDDEN {self.path} "
+                f"header={TUNNEL_AUTH_HEADER} len={len(got)} "
+                f"secret_set={bool(TUNNEL_AUTH_SECRET)} fail_open={FAIL_OPEN}"
+            )
             return _json_response(self, 403, {"ok": False, "error": "forbidden"})
 
         if self.path.startswith("/sigma/purchase"):
@@ -269,6 +282,7 @@ class Handler(BaseHTTPRequestHandler):
             return _json_response(self, 500, {"ok": False, "success": False, "error": str(e)})
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        # quiet
         return
 
 
