@@ -32,10 +32,7 @@ PORT = 8765
 
 # Cloudflare Tunnel should inject this header on requests that reach the origin.
 TUNNEL_AUTH_HEADER = os.getenv("MEADOW_TUNNEL_HEADER", "X-Meadow-Tunnel")
-
-# IMPORTANT: This is the ENV VAR NAME, not the secret itself.
-# Set this in your systemd service (or shell) as MEADOW_TUNNEL_SECRET="Mvato2025$!"
-TUNNEL_AUTH_SECRET = os.getenv("MEADOW_TUNNEL_SECRET", "").strip()
+TUNNEL_AUTH_SECRET = os.getenv("MEADOW_TUNNEL_SECRET", "")
 
 # During rollout, you can set MEADOW_TUNNEL_FAIL_OPEN=1 to avoid blocking POSTs
 FAIL_OPEN = (os.getenv("MEADOW_TUNNEL_FAIL_OPEN", "0").strip() == "1")
