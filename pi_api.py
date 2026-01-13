@@ -17,6 +17,7 @@ Key points:
 
 from __future__ import annotations
 
+import traceback
 import json
 import time
 import threading
@@ -43,15 +44,19 @@ ISO_NUM_TO_ALPHA = {
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
     body = json.dumps(payload).encode("utf-8")
-    handler.send_response(code)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    # CORS
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
-    handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.send_response(code)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        # CORS
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+        handler.end_headers()
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionResetError):
+        # client went away; nothing we can do
+        return
 
 
 def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
@@ -234,9 +239,9 @@ class Handler(BaseHTTPRequestHandler):
                 return _json_response(self, 200, {"ok": True, **payload})
 
             except Exception as e:
-                last_err = f"{type(e).__name__}: {e}"
+                last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
                 continue
-
+              
         return _json_response(self, 502, {"ok": False, "error": "sigma_failed", "detail": last_err})
 
     def _handle_vend(self) -> None:
