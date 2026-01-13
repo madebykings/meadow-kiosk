@@ -1,24 +1,11 @@
 # sigma_ipp_client.py
-#
-# Robust IPP-over-serial client for myPOS Sigma (USB CDC ACM /dev/ttyACM0, symlink /dev/sigma)
-# - Reads/returns the *final* frame for GET_STATUS / PURCHASE (Sigma often streams multiple frames per SID)
-# - Auto-recovers when terminal is "not idle" due to an unfinished previous TX (common STATUS=20 case)
-#   using COMPLETE_TX then CANCEL_TX (and optional CANCEL as a fallback)
-# - Uses MINOR UNITS by default (e.g. 100 == £1.00) because your whole stack uses amount_minor
-# - Logs full raw frames to /home/meadow/meadow-kiosk/sigma_serial.log
-#
-# Notes:
-# - Exact status/stage semantics are from myPOS IPP docs you linked (stages/status/transaction status).
-# - Treat "idle" as: final GET_STATUS frame has STATUS == "0"
-# - Treat "purchase approved" as: final PURCHASE frame has STATUS == "0"
-#   (optionally, if APPROVAL/APPROVED/RESULT exists, we can tighten that later)
-
 import time
 import uuid
 import serial
 import logging
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple
 
+# --- Dedicated Sigma serial log ---
 SIGMA_LOG_PATH = "/home/meadow/meadow-kiosk/sigma_serial.log"
 
 sigma_logger = logging.getLogger("sigma_serial")
@@ -44,9 +31,12 @@ class SigmaIPP:
     IPP-over-serial client for myPOS Sigma.
 
     Frame format:
-      2-byte big-endian length (including the 2-byte header) + ASCII payload of "KEY=VALUE\\r\\n" lines.
-    Ordering:
-      PROTOCOL must be first, METHOD must be second.
+      2-byte big-endian length (including the 2-byte header)
+      + ASCII payload of "KEY=VALUE\\r\\n" lines.
+
+    Ordering (important):
+      PROTOCOL must be first
+      METHOD must be second
     """
 
     def __init__(self, port: str = "/dev/sigma", baud: int = 115200, version: str = "202", timeout: float = 0.2):
@@ -58,7 +48,7 @@ class SigmaIPP:
     # ------------------------
     # Low-level helpers
     # ------------------------
-    def _send_frame(self, ser: serial.Serial, lines: List[str]) -> None:
+    def _send_frame(self, ser: serial.Serial, lines) -> None:
         payload_txt = "".join([ln + "\r\n" for ln in lines])
         payload = payload_txt.encode("ascii", errors="replace")
         total_len = len(payload) + 2
@@ -68,7 +58,7 @@ class SigmaIPP:
         ser.flush()
 
     def _read_frame(self, ser: serial.Serial, timeout: float = 5.0) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
-        end = time.time() + timeout
+        end = time.time() + float(timeout)
         while time.time() < end:
             hdr = ser.read(2)
             if len(hdr) < 2:
@@ -96,7 +86,6 @@ class SigmaIPP:
         return None, None
 
     def _toggle_lines(self, ser: serial.Serial) -> None:
-        # Some CDC-ACM devices behave better after DTR/RTS toggles
         sigma_log("Toggling DTR/RTS")
         try:
             ser.dtr = False
@@ -108,16 +97,14 @@ class SigmaIPP:
         except Exception as e:
             sigma_log(f"DTR/RTS toggle error: {e!r}")
 
-    def _drain(self, ser: serial.Serial, seconds: float = 0.8, label: str = "drain") -> None:
-        """Drain any unsolicited/in-flight frames for a short window."""
+    def _drain_frames(self, ser: serial.Serial, seconds: float = 1.0, label: str = "drain") -> None:
         end = time.time() + float(seconds)
         while time.time() < end:
             props, _ = self._read_frame(ser, timeout=0.25)
             if props:
                 sigma_log(f"<< ({label}): {props}")
 
-    def _send_method(self, ser: serial.Serial, method: str, extra: Optional[Dict[str, str]] = None) -> str:
-        """Send a method with a fresh SID. Returns SID used."""
+    def _send_method(self, ser: serial.Serial, method: str, extra_lines=None) -> str:
         sid = str(uuid.uuid4())
         lines = [
             "PROTOCOL=IPP",
@@ -125,274 +112,304 @@ class SigmaIPP:
             f"VERSION={self.version}",
             f"SID={sid}",
         ]
-        if extra:
-            for k, v in extra.items():
-                lines.append(f"{k}={v}")
+        if extra_lines:
+            lines.extend(extra_lines)
+        sigma_log(f">> {method} SID={sid}")
         self._send_frame(ser, lines)
         return sid
 
-    def _read_final_for_sid(
-        self,
-        ser: serial.Serial,
-        method: str,
-        sid: str,
-        max_wait: float,
-        log_nonmatching: bool = True,
-    ) -> Tuple[Optional[Dict[str, str]], List[Dict[str, str]]]:
+    # ------------------------
+    # GET_STATUS (final frame)
+    # ------------------------
+    def get_status_final(self, ser: serial.Serial, max_wait: float = 6.0, verbose_log: bool = False) -> Optional[Dict[str, str]]:
         """
-        Many Sigma methods stream multiple frames for the same SID.
-        We consider a frame "final" when TIMEOUT is "0" or missing.
-        Returns (final_props, all_matching_frames).
+        GET_STATUS can return multiple frames for the same SID.
+        Treat the FINAL frame as TIMEOUT==0 (or missing), otherwise return last seen.
         """
-        end = time.time() + float(max_wait)
-        matching: List[Dict[str, str]] = []
-        last: Optional[Dict[str, str]] = None
+        sid = str(uuid.uuid4())
+        lines = [
+            "PROTOCOL=IPP",
+            "METHOD=GET_STATUS",
+            f"VERSION={self.version}",
+            f"SID={sid}",
+        ]
 
+        self._drain_frames(ser, seconds=0.4, label="pre-status")
+
+        sigma_log(f">> GET_STATUS SID={sid}")
+        self._send_frame(ser, lines)
+
+        end = time.time() + float(max_wait)
+        last = None
         while time.time() < end:
             props, _ = self._read_frame(ser, timeout=0.8)
             if not props:
                 continue
 
-            if props.get("METHOD") == method and props.get("SID") == sid:
-                matching.append(props)
+            if verbose_log and not (props.get("METHOD") == "GET_STATUS" and props.get("SID") == sid):
+                sigma_log("<< (other): " + str(props))
+
+            if props.get("METHOD") == "GET_STATUS" and props.get("SID") == sid:
+                last = props
+                sigma_log("<< GET_STATUS(frame): " + str(props))
+
+                t = str(props.get("TIMEOUT") or "")
+                if t in ("", "0"):
+                    break
+
+        if last:
+            sigma_log("<< GET_STATUS(final): " + str(last))
+        return last
+
+    def get_status(self, max_wait: float = 10.0) -> Optional[Dict[str, str]]:
+        """
+        Public: open port, return FINAL GET_STATUS frame.
+        """
+        sigma_log(f"GET_STATUS start port={self.port} baud={self.baud}")
+        with serial.Serial(self.port, self.baud, timeout=self.timeout) as ser:
+            self._toggle_lines(ser)
+            return self.get_status_final(ser, max_wait=max_wait, verbose_log=True)
+
+    def _is_idle(self, st_final: Optional[Dict[str, str]]) -> bool:
+        if not st_final:
+            return False
+        return str(st_final.get("STATUS") or "") == "0"
+
+    # ------------------------
+    # Clear STATUS=20 ("NOT COMPLETED LAST TX")
+    # ------------------------
+    def clear_to_idle(self, ser: serial.Serial, max_wait: float = 25.0) -> bool:
+        """
+        If GET_STATUS(final).STATUS == 20, PURCHASE will reject until cleared.
+
+        Strategy:
+          1) COMPLETE_TX
+          2) If still not idle, CANCEL_TX
+          3) Poll GET_STATUS(final) until idle or timeout
+        """
+        st = self.get_status_final(ser, max_wait=6.0, verbose_log=True)
+        if not st:
+            sigma_log("clear_to_idle: GET_STATUS no response")
+            return False
+
+        if self._is_idle(st):
+            sigma_log("clear_to_idle: already idle")
+            return True
+
+        status_code = str(st.get("STATUS") or "")
+        sigma_log(f"clear_to_idle: not idle STATUS={status_code}; attempting recovery")
+
+        # COMPLETE_TX
+        self._send_method(ser, "COMPLETE_TX")
+        self._drain_frames(ser, seconds=1.5, label="after-COMPLETE_TX")
+
+        st = self.get_status_final(ser, max_wait=6.0, verbose_log=True)
+        if st and self._is_idle(st):
+            sigma_log("clear_to_idle: idle after COMPLETE_TX")
+            return True
+
+        # CANCEL_TX
+        self._send_method(ser, "CANCEL_TX")
+        self._drain_frames(ser, seconds=1.5, label="after-CANCEL_TX")
+
+        end = time.time() + float(max_wait)
+        while time.time() < end:
+            st = self.get_status_final(ser, max_wait=6.0, verbose_log=False)
+            if st:
+                sigma_log("clear_to_idle poll: " + str(st))
+            if st and self._is_idle(st):
+                sigma_log("clear_to_idle: idle after CANCEL_TX")
+                return True
+            time.sleep(1.0)
+
+        sigma_log("clear_to_idle: failed to reach idle before timeout")
+        return False
+
+    # ------------------------
+    # PURCHASE (wait final frame)
+    # ------------------------
+    def _purchase_one(self, ser: serial.Serial, amount_str: str, currency_num: str, reference: str, first_wait: float, final_wait: float) -> Dict[str, str]:
+        sid = str(uuid.uuid4())
+        lines = [
+            "PROTOCOL=IPP",
+            "METHOD=PURCHASE",
+            f"VERSION={self.version}",
+            f"SID={sid}",
+            f"AMOUNT={amount_str}",
+            f"CURRENCY={currency_num}",
+        ]
+        if reference:
+            lines.append(f"REFERENCE={reference}")
+
+        self._drain_frames(ser, seconds=0.4, label="pre-purchase")
+
+        sigma_log(f"PURCHASE >> amt={amount_str} currency={currency_num} ref={reference} sid={sid}")
+        self._send_frame(ser, lines)
+
+        # First matching frame
+        first = None
+        end_first = time.time() + float(first_wait)
+        while time.time() < end_first:
+            props, _ = self._read_frame(ser, timeout=1.0)
+            if not props:
+                continue
+            if props.get("METHOD") == "PURCHASE" and props.get("SID") == sid:
+                first = props
+                break
+
+        if not first:
+            sigma_log(f"PURCHASE no first response sid={sid}")
+            return {"PROTOCOL": "IPP", "METHOD": "PURCHASE", "SID": sid, "STATUS": "", "STAGE": ""}
+
+        status_first = str(first.get("STATUS") or "")
+        sigma_log(f"PURCHASE first_resp status={status_first} stage={first.get('STAGE')} timeout={first.get('TIMEOUT')} resp={first}")
+
+        # If rejected immediately, return first
+        if status_first != "0":
+            return first
+
+        # Accepted: keep reading until final for this SID
+        last = first
+        end = time.time() + float(final_wait)
+        while time.time() < end:
+            props, _ = self._read_frame(ser, timeout=5.0)
+            if not props:
+                continue
+            if props.get("METHOD") == "PURCHASE" and props.get("SID") == sid:
                 last = props
                 t = str(props.get("TIMEOUT") or "")
                 if t in ("", "0"):
-                    return last, matching
-            else:
-                if log_nonmatching:
-                    sigma_log(f"<< (other): {props}")
+                    sigma_log(f"PURCHASE final detected TIMEOUT={t} props={props}")
+                    break
 
-        return last, matching
+        return last
 
-    def _is_idle_final_status(self, st_final: Optional[Dict[str, str]]) -> bool:
-        return bool(st_final) and str(st_final.get("STATUS") or "") == "0"
-
-    # ------------------------
-    # GET_STATUS (final frame)
-    # ------------------------
-    def get_status_final(self, max_wait: float = 6.0) -> Optional[Dict[str, str]]:
-        """
-        Returns the *final* GET_STATUS frame for the request (TIMEOUT==0/missing).
-        """
-        sigma_log(f"GET_STATUS(final) start port={self.port} baud={self.baud}")
-
-        with serial.Serial(self.port, self.baud, timeout=self.timeout) as ser:
-            self._toggle_lines(ser)
-            self._drain(ser, seconds=0.4, label="pre-status")
-
-            sid = self._send_method(ser, "GET_STATUS")
-            sigma_log(f"GET_STATUS SID={sid}")
-
-            final, frames = self._read_final_for_sid(ser, "GET_STATUS", sid, max_wait=max_wait, log_nonmatching=True)
-            sigma_log(f"GET_STATUS frames={len(frames)} final={final}")
-            return final
-
-    # ------------------------
-    # Recovery to IDLE
-    # ------------------------
-    def ensure_idle(self, max_wait: float = 25.0) -> Dict[str, Any]:
-        """
-        Ensures terminal is idle before starting a new PURCHASE.
-
-        Strategy (based on your observed behavior + IPP docs):
-          1) GET_STATUS(final). If STATUS==0 -> idle.
-          2) If STATUS==20 (or other non-idle), attempt:
-             - COMPLETE_TX (lets terminal "finalise" the previous TX record)
-             - CANCEL_TX (clears terminal to idle)
-          3) Fallback: CANCEL (generic)
-          4) Poll GET_STATUS(final) until STATUS==0 or timeout.
-
-        Returns:
-          { ok: bool, status_final: dict|None, tried: [methods...], note: str }
-        """
-        tried: List[str] = []
-        note = ""
-
-        with serial.Serial(self.port, self.baud, timeout=self.timeout) as ser:
-            self._toggle_lines(ser)
-            self._drain(ser, seconds=0.6, label="pre-ensure-idle")
-
-            end = time.time() + float(max_wait)
-
-            def poll_status() -> Optional[Dict[str, str]]:
-                sid = self._send_method(ser, "GET_STATUS")
-                final, _frames = self._read_final_for_sid(ser, "GET_STATUS", sid, max_wait=6.0, log_nonmatching=False)
-                sigma_log(f"GET_STATUS(final) polled => {final}")
-                return final
-
-            st = poll_status()
-            if self._is_idle_final_status(st):
-                return {"ok": True, "status_final": st, "tried": tried, "note": "already_idle"}
-
-            # Non-idle; attempt recovery sequence (COMPLETE_TX -> CANCEL_TX -> CANCEL)
-            # COMPLETE_TX
-            tried.append("COMPLETE_TX")
-            sid_ct = self._send_method(ser, "COMPLETE_TX")
-            sigma_log(f"COMPLETE_TX SID={sid_ct}")
-            final_ct, _ = self._read_final_for_sid(ser, "COMPLETE_TX", sid_ct, max_wait=8.0, log_nonmatching=True)
-            sigma_log(f"COMPLETE_TX final={final_ct}")
-            self._drain(ser, seconds=0.6, label="post-complete_tx")
-
-            # CANCEL_TX
-            tried.append("CANCEL_TX")
-            sid_cx = self._send_method(ser, "CANCEL_TX")
-            sigma_log(f"CANCEL_TX SID={sid_cx}")
-            final_cx, _ = self._read_final_for_sid(ser, "CANCEL_TX", sid_cx, max_wait=8.0, log_nonmatching=True)
-            sigma_log(f"CANCEL_TX final={final_cx}")
-            self._drain(ser, seconds=0.6, label="post-cancel_tx")
-
-            # Poll for idle
-            while time.time() < end:
-                st = poll_status()
-                if self._is_idle_final_status(st):
-                    return {"ok": True, "status_final": st, "tried": tried, "note": "recovered_via_complete_cancel_tx"}
-                time.sleep(0.8)
-
-            # Fallback CANCEL (generic)
-            tried.append("CANCEL")
-            sid_can = self._send_method(ser, "CANCEL")
-            sigma_log(f"CANCEL SID={sid_can}")
-            final_can, _ = self._read_final_for_sid(ser, "CANCEL", sid_can, max_wait=6.0, log_nonmatching=True)
-            sigma_log(f"CANCEL final={final_can}")
-            self._drain(ser, seconds=0.6, label="post-cancel")
-
-            # Final poll window
-            end2 = time.time() + 10.0
-            while time.time() < end2:
-                st = poll_status()
-                if self._is_idle_final_status(st):
-                    return {"ok": True, "status_final": st, "tried": tried, "note": "recovered_via_cancel_fallback"}
-                time.sleep(0.8)
-
-            note = "failed_to_reach_idle"
-            return {"ok": False, "status_final": st, "tried": tried, "note": note}
-
-    # ------------------------
-    # PURCHASE (final frame)
-    # ------------------------
     def purchase(
         self,
-        amount_minor: int,
+        amount_minor,
         currency_num: str = "826",
         reference: str = "",
         max_wait: float = 180.0,
-        auto_recover_idle: bool = True,
+        auto_clear_not_completed_last_tx: bool = True,
     ) -> Dict[str, Any]:
         """
-        Blocking PURCHASE using MINOR UNITS (your desired flow).
+        Blocking purchase with correct preconditions.
 
-        Behaviour:
-          - Optionally ensure terminal idle first (auto_recover_idle=True)
-          - Sends PURCHASE with AMOUNT=<minor units> (e.g. 100)
-          - Waits for final PURCHASE frame (TIMEOUT==0/missing) and returns it
+        Key behaviour learned from Sigma IPP:
+          - If GET_STATUS(final).STATUS == 20 ("NOT COMPLETED LAST TX"),
+            PURCHASE will reject until you COMPLETE_TX (preferred) or CANCEL_TX.
+          - PURCHASE returns multiple frames; final typically TIMEOUT==0.
 
-        Returns:
-          {
-            ok: bool,
-            approved: bool,
-            status: str,
-            stage: str,
-            raw: dict,
-            receipt: str,
-            txid: str,
-            idle_recovery: {...} (if attempted)
-          }
+        Attempts:
+          1) decimal (e.g. "1.00")
+          2) minor units (e.g. "100")
+        (Your terminal accepted both formats once idle; keeping both to be safe.)
         """
-        # Normalize to int
+
+        # Normalize to integer minor units
         try:
             minor_int = int(amount_minor)
         except Exception:
             minor_int = int(round(float(amount_minor) * 100))
 
+        attempts = [
+            f"{minor_int/100:.2f}",   # "1.00"
+            str(minor_int),          # "100"
+        ]
+
         sigma_log(
             f"PURCHASE start amount_minor={amount_minor} minor_int={minor_int} currency_num={currency_num} reference={reference} port={self.port}"
         )
 
-        idle_recovery = None
-        if auto_recover_idle:
-            idle_recovery = self.ensure_idle(max_wait=25.0)
-            sigma_log(f"ensure_idle => {idle_recovery}")
-            if not idle_recovery.get("ok"):
-                # If we can't get idle, PURCHASE will likely reject instantly (as you saw).
-                st = idle_recovery.get("status_final") or {}
-                return {
-                    "ok": False,
-                    "approved": False,
-                    "status": str(st.get("STATUS") or ""),
-                    "stage": str(st.get("STAGE") or ""),
-                    "raw": dict(st),
-                    "receipt": "",
-                    "txid": "",
-                    "idle_recovery": idle_recovery,
-                    "error": "not_idle",
-                }
+        last_matching: Dict[str, str] = {}
 
         with serial.Serial(self.port, self.baud, timeout=self.timeout) as ser:
             self._toggle_lines(ser)
-            self._drain(ser, seconds=0.6, label="pre-purchase")
 
-            sid = str(uuid.uuid4())
-            lines = [
-                "PROTOCOL=IPP",
-                "METHOD=PURCHASE",
-                f"VERSION={self.version}",
-                f"SID={sid}",
-                f"AMOUNT={minor_int}",
-                f"CURRENCY={currency_num}",
-            ]
-            if reference:
-                lines.append(f"REFERENCE={reference}")
+            # Optional: clear STATUS=20 before attempting purchase
+            if auto_clear_not_completed_last_tx:
+                st = self.get_status_final(ser, max_wait=6.0, verbose_log=True)
+                if st and str(st.get("STATUS") or "") == "20":
+                    sigma_log("PURCHASE precheck: STATUS=20 (NOT COMPLETED LAST TX) -> clearing to idle")
+                    self.clear_to_idle(ser, max_wait=25.0)
 
-            self._send_frame(ser, lines)
-            sigma_log(f"PURCHASE sent sid={sid} amount={minor_int} currency={currency_num} reference={reference}")
+            # Ensure we're idle
+            st = self.get_status_final(ser, max_wait=6.0, verbose_log=True)
+            if not st:
+                return {"approved": False, "status": "", "stage": "", "raw": {}, "receipt": "", "txid": ""}
 
-            # Wait for final purchase frame for this SID
-            final, frames = self._read_final_for_sid(ser, "PURCHASE", sid, max_wait=max_wait, log_nonmatching=True)
-            sigma_log(f"PURCHASE frames={len(frames)} final={final}")
+            if not self._is_idle(st):
+                # If not idle, attempt recovery (covers STATUS=20 and other non-idle conditions)
+                sigma_log(f"PURCHASE precheck: terminal not idle STATUS={st.get('STATUS')} -> attempting clear_to_idle")
+                ok = self.clear_to_idle(ser, max_wait=25.0)
+                if not ok:
+                    # Return the final status frame so caller can see why it refused
+                    return {
+                        "approved": False,
+                        "status": str(st.get("STATUS") or ""),
+                        "stage": str(st.get("STAGE") or ""),
+                        "raw": dict(st),
+                        "receipt": "",
+                        "txid": "",
+                    }
 
-            if not final:
-                return {
-                    "ok": False,
-                    "approved": False,
-                    "status": "",
-                    "stage": "",
-                    "raw": {},
-                    "receipt": "",
-                    "txid": "",
-                    "idle_recovery": idle_recovery,
-                    "error": "timeout_no_final_frame",
-                }
+            # Run attempts
+            for amt in attempts:
+                resp = self._purchase_one(
+                    ser,
+                    amount_str=amt,
+                    currency_num=currency_num,
+                    reference=reference,
+                    first_wait=25.0,
+                    final_wait=float(max_wait),
+                )
+                last_matching = resp
+                # If accepted initially, we'll have reached a final frame (TIMEOUT==0)
+                # Regardless, stop after the first attempt that didn't immediately reject by formatting.
+                # If it rejected immediately with a format issue, try next format.
+                if str(resp.get("STATUS") or "") == "0":
+                    break
+                # If immediate reject on stage 1 etc, try the next format
+                # (If user cancels/declines you'll still see non-zero; we still stop after first decimal attempt
+                # only if it progressed beyond "format" - but safest is to try both always.)
+                # We'll try both formats unless the first was accepted (STATUS==0).
+                continue
 
-            status = str(final.get("STATUS") or "")
-            stage = str(final.get("STAGE") or "")
+        status = str(last_matching.get("STATUS") or "")
+        stage = str(last_matching.get("STAGE") or "")
 
-            # Primary truth: STATUS==0 => success (approved)
+        # Approval:
+        # - Prefer APPROVAL / TX_STATUS fields if present at final stage
+        # - Otherwise STATUS == "0" means flow accepted/ok
+        approved = False
+        if "APPROVAL" in last_matching:
+            # myPOS often uses APPROVAL=00 for approved
+            approved = str(last_matching.get("APPROVAL") or "").strip() in ("00", "0")
+        elif "TX_STATUS" in last_matching:
+            approved = str(last_matching.get("TX_STATUS") or "").strip() in ("0", "00")
+        elif "APPROVED" in last_matching:
+            approved = str(last_matching.get("APPROVED")).lower() in ("1", "true", "yes")
+        elif "RESULT" in last_matching:
+            approved = str(last_matching.get("RESULT")).upper() in ("APPROVED", "00")
+        else:
             approved = (status == "0")
 
-            # If firmware provides any of these, we can optionally refine (kept conservative here)
-            # APPROVAL often appears as '00' for approved, otherwise not approved.
-            if "APPROVAL" in final:
-                approved = str(final.get("APPROVAL") or "").strip() == "00"
+        receipt = str(last_matching.get("RECEIPT") or "")
+        txid = str(
+            last_matching.get("RRN")
+            or last_matching.get("AUTH_CODE")
+            or last_matching.get("AUTH")
+            or last_matching.get("TXID")
+            or ""
+        )
 
-            # E-receipt properties may appear on some firmwares; keep whatever is present
-            receipt = str(final.get("RECEIPT") or "")
+        sigma_log(f"PURCHASE done approved={approved} status={status} stage={stage} txid={txid} raw={last_matching}")
 
-            # Best tx id we can extract from fields that tend to appear:
-            txid = (
-                str(final.get("RRN") or "")
-                or str(final.get("AUTH_CODE") or "")
-                or str(final.get("TXID") or "")
-                or ""
-            )
-
-            return {
-                "ok": True,
-                "approved": bool(approved),
-                "status": status,
-                "stage": stage,
-                "raw": dict(final),
-                "receipt": receipt,
-                "txid": txid,
-                "idle_recovery": idle_recovery,
-            }
+        return {
+            "approved": bool(approved),
+            "status": status,
+            "stage": stage,
+            "raw": dict(last_matching or {}),
+            "receipt": receipt,
+            "txid": txid,
+        }
