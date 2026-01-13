@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Meadow Pi API (behind Cloudflare Tunnel)
+"""Meadow Pi API (simple)
 
 Endpoints (JSON):
   POST /sigma/purchase  { amount_minor:int, currency_num:str|int, reference:str }
   POST /vend            { motor:int }
   GET  /health
 
-Security:
-  - Intended to be exposed via Cloudflare Tunnel.
-  - Requires a secret header for ALL POST endpoints by default.
-  - During rollout, set MEADOW_TUNNEL_FAIL_OPEN=1 to avoid blocking POSTs.
+Notes:
+  - Designed to sit behind Cloudflare Tunnel at https://kiosk1-pi.meadowvending.com
+  - No auth in code (for now).
 """
 
 from __future__ import annotations
@@ -19,7 +18,6 @@ import os
 import time
 import threading
 import traceback
-import hmac
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional, Tuple
 
@@ -31,20 +29,6 @@ from payment.sigma.sigma_ipp_client import SigmaIppClient
 HOST = "127.0.0.1"
 PORT = 8765
 
-# Cloudflare Tunnel injects this header on requests that reach the origin.
-# Your cloudflared config.yml sets it via:
-# originRequest:
-#   httpHeader:
-#     X-Meadow-Tunnel: "Mvato2025$!"
-TUNNEL_AUTH_HEADER = os.getenv("MEADOW_TUNNEL_HEADER", "X-Meadow-Tunnel").strip()
-
-# Store secret in ENV (do NOT hardcode in repo)
-# e.g. export MEADOW_TUNNEL_SECRET='Mvato2025$!'
-TUNNEL_AUTH_SECRET = os.getenv("MEADOW_TUNNEL_SECRET", "")
-
-# During rollout, allow POSTs even if secret not configured / header missing
-FAIL_OPEN = (os.getenv("MEADOW_TUNNEL_FAIL_OPEN", "0").strip() == "1")
-
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
     body = json.dumps(payload).encode("utf-8")
@@ -52,7 +36,7 @@ def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str
         handler.send_response(code)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
-        # CORS (fine for now)
+        # CORS
         handler.send_header("Access-Control-Allow-Origin", "*")
         handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         handler.send_header("Access-Control-Allow-Headers", "Content-Type")
@@ -71,23 +55,6 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
         return json.loads(raw.decode("utf-8"))
     except Exception:
         return {}
-
-
-def _require_tunnel_auth(handler: BaseHTTPRequestHandler) -> bool:
-    """
-    Require a shared secret in a header for POST endpoints.
-
-    - If MEADOW_TUNNEL_SECRET is not set:
-        - FAIL_OPEN=1 => allow
-        - else => block
-    - If MEADOW_TUNNEL_SECRET is set:
-        - header must match exactly
-    """
-    if not TUNNEL_AUTH_SECRET:
-        return True if FAIL_OPEN else False
-
-    got = (handler.headers.get(TUNNEL_AUTH_HEADER) or "").strip()
-    return hmac.compare_digest(got, TUNNEL_AUTH_SECRET)
 
 
 class RuntimeState:
@@ -161,7 +128,6 @@ def _config_poll_loop() -> None:
 
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
-        # CORS preflight must never be blocked
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
@@ -177,26 +143,11 @@ class Handler(BaseHTTPRequestHandler):
                 "sigma_path": sigma_path,
                 "sigma_baud": sigma_baud,
                 "motors_loaded": motors_ok,
-                "tunnel_auth": {
-                    "header": TUNNEL_AUTH_HEADER,
-                    "secret_set": bool(TUNNEL_AUTH_SECRET),
-                    "fail_open": FAIL_OPEN,
-                }
             })
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
-        # Lock down POST endpoints to only traffic that includes our tunnel-secret header
-        if not _require_tunnel_auth(self):
-            got = (self.headers.get(TUNNEL_AUTH_HEADER) or "")
-            print(
-                f"[pi_api] FORBIDDEN {self.path} "
-                f"header={TUNNEL_AUTH_HEADER} len={len(got)} "
-                f"secret_set={bool(TUNNEL_AUTH_SECRET)} fail_open={FAIL_OPEN}"
-            )
-            return _json_response(self, 403, {"ok": False, "error": "forbidden"})
-
         if self.path.startswith("/sigma/purchase"):
             return self._handle_sigma_purchase()
 
@@ -282,7 +233,6 @@ class Handler(BaseHTTPRequestHandler):
             return _json_response(self, 500, {"ok": False, "success": False, "error": str(e)})
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # quiet
         return
 
 
