@@ -88,7 +88,8 @@ def heartbeat(cfg, imei=None):
     url = api_base(cfg) + "/kiosk-heartbeat"
     payload = {
         "kiosk_id": cfg["kiosk_id"],
-        "config_version": cfg.get("config_version"),
+        "key": cfg.get("api_key"),
+        "pi_git": (cfg.get("pi_git") or cfg.get("config_version")),
         "ts": int(time.time()),
     }
     if imei:
