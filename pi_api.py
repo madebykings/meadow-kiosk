@@ -19,10 +19,13 @@ import os
 import time
 import threading
 import traceback
+import requests
+import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional, Tuple
 
 from config_remote import load_provision, fetch_config_from_wp
+from modem import get_imei
 from motors import MotorController
 from payment.sigma.sigma_ipp_client import SigmaIppClient
 
@@ -74,6 +77,37 @@ class RuntimeState:
         self._derived_motor_map: Dict[int, int] = {}
         self._derived_spin_map: Dict[int, float] = {}
 
+    # Heartbeat cache
+    self._last_heartbeat_ok: bool = False
+    self._last_heartbeat_error: str = ""
+    self._last_heartbeat_ts: int = 0
+    self._cached_imei: str = ""
+
+def get_cfg_copy(self) -> Dict[str, Any]:
+    with self._lock:
+        return dict(self._cfg)
+
+def mark_heartbeat_result(self, ok: bool, err: str = "") -> None:
+    with self._lock:
+        self._last_heartbeat_ok = bool(ok)
+        self._last_heartbeat_error = (err or "")[:300]
+        self._last_heartbeat_ts = int(time.time())
+
+def get_heartbeat_status(self) -> Dict[str, Any]:
+    with self._lock:
+        return {
+            "ok": self._last_heartbeat_ok,
+            "error": self._last_heartbeat_error,
+            "ts": self._last_heartbeat_ts,
+        }
+
+def get_cached_imei(self) -> str:
+    with self._lock:
+        return self._cached_imei
+
+def set_cached_imei(self, imei: str) -> None:
+    with self._lock:
+        self._cached_imei = (imei or "")[:40]
     def mark_poll_result(self, ok: bool, err: str = "") -> None:
         with self._lock:
             self._last_config_ok = bool(ok)
@@ -129,6 +163,8 @@ class RuntimeState:
                     "motors": self._derived_motor_map,
                     "spin_time": self._derived_spin_map,
                 },
+                "heartbeat": self.get_heartbeat_status(),
+                "cached_imei": self._cached_imei,
                 "sigma_path": self._sigma_path,
                 "sigma_baud": self._sigma_baud,
                 "motors_loaded": self._motors is not None,
@@ -142,6 +178,58 @@ class RuntimeState:
         with self._lock:
             return self._motors
 
+
+
+def _git_short_hash() -> str:
+    """Return short git hash for current checkout, or empty string."""
+    try:
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=cwd, stderr=subprocess.DEVNULL)
+        return out.decode().strip()
+    except Exception:
+        return ""
+
+def _post_heartbeat(cfg: Dict[str, Any]) -> None:
+    """POST heartbeat to WP if config contains kiosk_id + api_key + domain."""
+    try:
+        domain = (cfg.get("domain") or "").strip()
+        kiosk_id = int(cfg.get("kiosk_id") or 0)
+        key = (cfg.get("api_key") or "").strip()
+        if not domain or not kiosk_id or not key:
+            # can't heartbeat yet
+            return
+
+        url = domain.rstrip("/") + "/wp-json/meadow/v1/kiosk-heartbeat"
+
+        imei = STATE.get_cached_imei()
+        if not imei:
+            imei = get_imei() or ""
+            if imei:
+                STATE.set_cached_imei(imei)
+
+        payload = {
+            "kiosk_id": kiosk_id,
+            "key": key,
+            "pi_git": _git_short_hash(),
+            "ts": int(time.time()),
+        }
+        if imei:
+            payload["imei"] = imei
+
+        r = requests.post(url, json=payload, timeout=6)
+        if r.status_code != 200:
+            STATE.mark_heartbeat_result(False, f"HTTP {r.status_code}")
+        else:
+            STATE.mark_heartbeat_result(True, "")
+    except Exception as e:
+        STATE.mark_heartbeat_result(False, str(e)[:200])
+
+def _heartbeat_loop() -> None:
+    # heartbeat every 60s
+    while True:
+        cfg = STATE.get_cfg_copy()
+        _post_heartbeat(cfg)
+        time.sleep(60)
 
 STATE = RuntimeState()
 
@@ -291,6 +379,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     threading.Thread(target=_config_poll_loop, daemon=True).start()
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
     httpd = HTTPServer((HOST, PORT), Handler)
     print(f"[pi_api] listening on http://{HOST}:{PORT}")
     httpd.serve_forever()
