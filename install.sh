@@ -65,20 +65,11 @@ sudo -u meadow mkdir -p /home/meadow/.config/autostart
 sudo cp -f "$SCRIPT_DIR/autostart/meadow-launcher.desktop" /home/meadow/.config/autostart/meadow-launcher.desktop
 sudo chown meadow:meadow /home/meadow/.config/autostart/meadow-launcher.desktop
 
-# systemd --user (most reliable across environments)
-sudo -u meadow mkdir -p /home/meadow/.config/systemd/user
-sudo cp -f "$SCRIPT_DIR/systemd-user/meadow-launcher.service" /home/meadow/.config/systemd/user/meadow-launcher.service
-sudo chown -R meadow:meadow /home/meadow/.config/systemd
-
-# Allow the meadow user's services to run at boot without an interactive login
-sudo loginctl enable-linger meadow || true
-
-# Enable the user service (ignore failures if no user session is active yet)
-sudo -u meadow systemctl --user daemon-reload || true
-sudo -u meadow systemctl --user enable meadow-launcher.service || true
-sudo -u meadow systemctl --user restart meadow-launcher.service || true
-
-
+echo "=== Configure Labwc autostart (Wayland) ==="
+sudo -u meadow mkdir -p /home/meadow/.config/labwc
+sudo cp -f "$SCRIPT_DIR/labwc/autostart" /home/meadow/.config/labwc/autostart
+sudo chmod +x /home/meadow/.config/labwc/autostart
+sudo chown meadow:meadow /home/meadow/.config/labwc/autostart
 
 echo "=== Desktop icons (Enter/Exit kiosk) ==="
 sudo mkdir -p /home/meadow/Desktop
