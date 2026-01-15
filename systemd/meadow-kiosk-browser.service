@@ -3,9 +3,6 @@ Description=Meadow Kiosk Browser (Chromium watchdog loop)
 After=graphical.target network-online.target
 Wants=network-online.target
 
-# If kiosk starts, launcher must stop (no popup storms)
-Conflicts=meadow-launcher.service
-
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
@@ -14,18 +11,17 @@ Type=simple
 User=meadow
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/meadow/.Xauthority
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 
-# Enter kiosk should always work even if stop flag exists
+# Ensure kiosk is allowed to run
 ExecStartPre=/bin/bash -lc 'rm -f /tmp/meadow_kiosk_stop || true'
 
 ExecStart=/bin/bash /home/meadow/kiosk-browser.sh
 
-# On stop: request the script exits + kill kiosk chromium
-ExecStop=/bin/bash -lc 'touch /tmp/meadow_kiosk_stop; pkill -f "chromium.*--kiosk" 2>/dev/null || true; pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true'
+ExecStop=/bin/bash -lc 'touch /tmp/meadow_kiosk_stop; pkill -f "chromium.*--kiosk" || true; pkill -f "chromium-browser.*--kiosk" || true'
 
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=10
 
 StandardOutput=journal
 StandardError=journal
