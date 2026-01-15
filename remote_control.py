@@ -175,8 +175,9 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
         params["token"] = tok
 
     headers = {"Cache-Control": "no-store"}
-
+    log(f"[control] auth debug kiosk_id={kiosk_id} key={_mask(key)} cfg.api_key={_mask(cfg.get('api_key',''))} prov.api_key={_mask(str(prov.get('api_key','')))}")
     url = api + "/next-command"
+    
     r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
 
     if r.status_code >= 400:
