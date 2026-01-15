@@ -1,5 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Meadow Launcher
-Exec=python3 /home/meadow/kiosk-launcher.py
-X-GNOME-Autostart-enabled=true
