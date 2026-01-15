@@ -1,229 +1,344 @@
 #!/usr/bin/env python3
+# /home/meadow/meadow-kiosk/remote_control.py
+#
+# Poll WP for control commands (exit/enter/reload/set_url/reboot/shutdown/update_code)
+# and execute them locally. IMPORTANT: never spawn multiple kiosk-launchers.
+
+import json
 import os
 import time
-import json
 import subprocess
 from typing import Any, Dict, Optional
 
 import requests
 
-from config_remote import get_config
-from modem import get_imei
+# -------------------------------------------------------------------
+# Paths / config
+# -------------------------------------------------------------------
 
+PROVISION_PATH = "/boot/provision.json"
+CACHE_PATH = "/home/meadow/kiosk.config.cache.json"
+
+KIOSK_URL_FILE = "/home/meadow/kiosk.url"
 STOP_FLAG = "/tmp/meadow_kiosk_stop"
-URL_FILE = "/home/meadow/kiosk.url"
-HEARTBEAT_FILE = os.environ.get("MEADOW_HEARTBEAT_FILE", "/tmp/meadow_kiosk_heartbeat")
-WP_HEARTBEAT_FILE = os.environ.get("MEADOW_WP_HEARTBEAT_FILE", "/tmp/meadow_wp_heartbeat")
 
-DISPLAY_ENV = {
-    "DISPLAY": os.environ.get("DISPLAY", ":0"),
-    "XAUTHORITY": os.environ.get("XAUTHORITY", "/home/meadow/.Xauthority"),
-}
+LAUNCHER = "/home/meadow/kiosk-launcher.py"
+KIOSK_BROWSER = "/home/meadow/kiosk-browser.sh"
+UPDATE_SCRIPT = "/home/meadow/update-meadow.sh"
 
-def api_base(cfg: Dict[str, Any]) -> str:
-    return cfg["domain"].rstrip("/") + "/wp-json/meadow/v1"
+LOG_PATH = "/home/meadow/state/remote-control.log"
 
-def fetch_control_command(cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Fetch a non-vend control command from WP.
+POLL_INTERVAL = float(os.environ.get("MEADOW_CONTROL_POLL_INTERVAL", "2.5"))
+HTTP_TIMEOUT = float(os.environ.get("MEADOW_CONTROL_HTTP_TIMEOUT", "8"))
 
-    Expected WP response (examples):
-      {} or [] -> none
-      {"id": 10, "action": "reload"} 
-      {"id": 11, "action": "set_url", "url": "https://..."}
-      {"id": 12, "action": "exit_kiosk"}
-      {"id": 13, "action": "enter_kiosk"}
-      {"id": 14, "action": "reboot"}
+# Use the *same* auth scheme you already use for config/heartbeat
+# provision.json should contain:
+# { "domain": "https://meadowvending.com", "api_key": "...", "kiosk_token": "..." }
+# and kiosk.config.cache.json contains kiosk_id.
+CONTROL_SCOPE = "control"
 
-    Uses existing endpoint /next-command with scope=control so you don't need a new route.
-    Vend commands can continue to use the same endpoint without scope or with scope=vend.
-    """
-    url = api_base(cfg) + "/next-command"
-    params = {
-        "kiosk_id": cfg.get("kiosk_id"),
-        "key": cfg.get("api_key"),
-        "scope": "control",
-    }
 
-    def touch_wp_heartbeat() -> None:
-        try:
-            with open(WP_HEARTBEAT_FILE, "a"):
-                os.utime(WP_HEARTBEAT_FILE, None)
-        except Exception:
-            pass
-
-    def touch_heartbeat() -> None:
-        try:
-            with open(HEARTBEAT_FILE, "w") as f:
-                f.write(str(int(time.time())))
-        except Exception:
-            pass
-
+def log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    line = f"{ts} {msg}"
     try:
-        r = requests.get(url, params=params, timeout=5)
-        if r.status_code != 200:
-            return None
-        # If we can reach WP at all, update heartbeat so the kiosk watchdog
-        # can detect "hung" sessions vs offline connectivity.
-        touch_heartbeat()
-        touch_wp_heartbeat()
-        data = r.json()
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    print(line, flush=True)
+
+
+def load_json(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
         return None
 
-    # WP might return list; take first
-    if isinstance(data, list):
-        if not data:
-            return None
-        data = data[0]
 
-    if not isinstance(data, dict) or not data:
-        return None
+def load_provision() -> Dict[str, Any]:
+    prov = load_json(PROVISION_PATH) or {}
+    return prov
 
-    # Ignore vend-style commands (motor) in this poller
-    if data.get("motor") and not data.get("action"):
-        return None
 
-    if not data.get("action") or not data.get("id"):
-        return None
+def load_cached_config() -> Dict[str, Any]:
+    cfg = load_json(CACHE_PATH) or {}
+    return cfg
 
-    return data
 
-def ack(cfg: Dict[str, Any], cmd_id: int, success: bool, note: str = "") -> None:
-    url = api_base(cfg) + "/command-complete"
-    payload = {
-        "id": int(cmd_id),
-        "key": cfg.get("api_key"),
-        "success": bool(success),
-        "ts": int(time.time()),
-    }
-    if note:
-        payload["note"] = note[:200]
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception:
-        pass
+def wp_api_base(prov: Dict[str, Any]) -> str:
+    domain = (prov.get("domain") or "").rstrip("/")
+    return domain + "/wp-json/meadow/v1"
 
-def write_url(new_url: str) -> None:
-    new_url = (new_url or "").strip()
-    if not new_url:
-        return
-    # Basic validation: keep it https and avoid obvious garbage
-    if not (new_url.startswith("https://") or new_url.startswith("http://")):
-        return
-    tmp_path = URL_FILE + ".tmp"
-    os.makedirs(os.path.dirname(URL_FILE), exist_ok=True)
-    with open(tmp_path, "w") as f:
-        f.write(new_url + "\n")
-    os.replace(tmp_path, URL_FILE)
 
-def clear_stop_flag() -> None:
-    try:
-        os.remove(STOP_FLAG)
-    except FileNotFoundError:
-        pass
+def build_env_for_gui() -> Dict[str, str]:
+    """Ensure spawned processes can talk to the GUI session."""
+    env = dict(os.environ)
+    env.setdefault("DISPLAY", ":0")
+    env.setdefault("XAUTHORITY", "/home/meadow/.Xauthority")
+    return env
 
-def set_stop_flag() -> None:
-    with open(STOP_FLAG, "w") as f:
-        f.write(str(int(time.time())))
+
+# -------------------------------------------------------------------
+# Process helpers
+# -------------------------------------------------------------------
 
 def pkill_chromium() -> None:
-    # Be tolerant across distros/package names
+    # be slightly broad but safe (only kiosk chromium)
     subprocess.call(["pkill", "-f", "chromium.*--kiosk"])
     subprocess.call(["pkill", "-f", "chromium-browser.*--kiosk"])
     subprocess.call(["pkill", "-f", "chromium --kiosk"])
     subprocess.call(["pkill", "-f", "chromium-browser --kiosk"])
 
-def is_kiosk_running() -> bool:
+
+def is_chromium_running() -> bool:
     try:
         out = subprocess.check_output(["pgrep", "-f", "chromium.*--kiosk"], text=True).strip()
         return bool(out)
     except Exception:
         return False
 
-def start_kiosk_browser() -> None:
-    # Start the loop script; it will relaunch chromium if it closes.
-    env = os.environ.copy()
-    env.update(DISPLAY_ENV)
-    subprocess.Popen(["/home/meadow/kiosk-browser.sh"], env=env)
 
-def start_launcher_popup() -> None:
-    env = os.environ.copy()
-    env.update(DISPLAY_ENV)
-    subprocess.Popen(["python3", "/home/meadow/kiosk-launcher.py"], env=env)
+def kill_launcher_processes() -> None:
+    # Clean up any duplicated launchers from a previous bug state
+    subprocess.call(["pkill", "-f", LAUNCHER])
 
-def handle_action(action: str, cmd: Dict[str, Any]) -> (bool, str):
-    action = (action or "").strip().lower()
-    if action == "reload":
-        clear_stop_flag()
-        pkill_chromium()
-        return True, "reloaded"
-    if action == "set_url":
-        url = (cmd.get("url") or cmd.get("kiosk_url") or "").strip()
-        if not url:
-            return False, "missing url"
-        write_url(url)
-        clear_stop_flag()
-        pkill_chromium()
-        return True, "url updated"
-    if action == "exit_kiosk" or action == "enter_desktop":
-        set_stop_flag()
-        pkill_chromium()
-        # bring launcher back for local operator
-        start_launcher_popup()
-        return True, "exited"
-    if action == "enter_kiosk":
-        clear_stop_flag()
-        if not is_kiosk_running():
-            start_kiosk_browser()
-        return True, "entered"
-    if action == "update_code":
-        # Pull latest code and restart services. Runs async; check /home/meadow/update.log.
-        payload = cmd.get("payload") or {}
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = {}
-        branch = (payload.get("branch") or cmd.get("branch") or "main")
-        subprocess.Popen(["bash", "/home/meadow/update-meadow.sh", str(branch)])
-        return True, f"updating ({branch})"
 
-    if action == "reboot":
-        # Needs passwordless sudo for meadow user (documented in README)
-        subprocess.call(["sudo", "reboot"])
-        return True, "rebooting"
-    if action == "shutdown":
-        subprocess.call(["sudo", "shutdown", "-h", "now"])
-        return True, "shutting down"
-    return False, f"unknown action: {action}"
+def is_launcher_running() -> bool:
+    try:
+        out = subprocess.check_output(["pgrep", "-f", LAUNCHER], text=True).strip()
+        return bool(out)
+    except Exception:
+        return False
 
-def maybe_seed_url_from_cfg(cfg: Dict[str, Any]) -> None:
-    # If WP config provides kiosk_url and local file doesn't exist, write it.
-    if os.path.exists(URL_FILE):
+
+def start_launcher_once(env: Dict[str, str]) -> None:
+    """
+    Start the launcher if not already running.
+    This is CRITICAL to avoid popup storms.
+    """
+    if is_launcher_running():
+        log("[control] launcher already running; not starting another")
         return
-    url = (cfg.get("kiosk_url") or cfg.get("ui_url") or "").strip()
-    if url:
-        write_url(url)
 
-def main():
-    imei = get_imei()  # best effort
-    cfg = get_config(imei=imei)
-    maybe_seed_url_from_cfg(cfg)
+    # small safety: if stale dupes existed, kill then start
+    kill_launcher_processes()
+    time.sleep(0.2)
 
-    poll_s = float(os.environ.get("MEADOW_CONTROL_POLL", "2.0"))
+    # Start launcher detached
+    subprocess.Popen(["python3", LAUNCHER], env=env)
+    log("[control] launcher started")
+
+
+def start_kiosk(env: Dict[str, str]) -> None:
+    """
+    Enter kiosk mode:
+    - remove stop flag
+    - kill any launcher
+    - start kiosk loop (kiosk-browser.sh)
+    """
+    try:
+        if os.path.exists(STOP_FLAG):
+            os.remove(STOP_FLAG)
+    except Exception:
+        pass
+
+    kill_launcher_processes()
+    subprocess.Popen([KIOSK_BROWSER], env=env)
+    log("[control] kiosk started")
+
+
+def exit_to_desktop(env: Dict[str, str]) -> None:
+    """
+    Exit kiosk mode:
+    - create stop flag so kiosk loop exits
+    - kill chromium kiosk
+    - show launcher (only once)
+    """
+    try:
+        with open(STOP_FLAG, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
+    except Exception:
+        pass
+
+    pkill_chromium()
+    log("[control] kiosk stopped; chromium killed")
+
+    # show launcher but do NOT spam it
+    start_launcher_once(env)
+
+
+def reload_browser(env: Dict[str, str]) -> None:
+    """
+    Reload kiosk chromium.
+    If chromium isn't running, start kiosk (this matches “reload” expectation).
+    """
+    if is_chromium_running():
+        pkill_chromium()
+        time.sleep(0.5)
+        subprocess.Popen([KIOSK_BROWSER], env=env)
+        log("[control] chromium reloaded (kiosk-browser.sh relaunched)")
+    else:
+        log("[control] chromium not running; starting kiosk")
+        start_kiosk(env)
+
+
+def set_url_and_reload(env: Dict[str, str], url: str) -> None:
+    url = (url or "").strip()
+    if not url:
+        log("[control] set_url: empty url; ignored")
+        return
+
+    # Write URL file (what kiosk-browser.sh reads)
+    try:
+        with open(KIOSK_URL_FILE, "w", encoding="utf-8") as f:
+            f.write(url + "\n")
+        log(f"[control] kiosk.url updated to: {url}")
+    except Exception as e:
+        log(f"[control] failed writing kiosk.url: {e}")
+        return
+
+    # Reload kiosk to pick it up
+    reload_browser(env)
+
+
+# -------------------------------------------------------------------
+# WP polling + acknowledgements
+# -------------------------------------------------------------------
+
+def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    api = wp_api_base(prov)
+    kiosk_id = int(cfg.get("kiosk_id") or 0)
+    key = prov.get("api_key") or ""
+
+    if not api or not kiosk_id or not key:
+        return None
+
+    params = {
+        "kiosk_id": kiosk_id,
+        "scope": CONTROL_SCOPE,
+        "_t": int(time.time()),
+    }
+
+    headers = {
+        "X-API-KEY": str(key),
+        "Cache-Control": "no-store",
+    }
+
+    url = api + "/next-command"
+    r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict):
+        return None
+
+    # Empty response is fine
+    if not data.get("id") or not data.get("action"):
+        return None
+
+    return data
+
+
+def wp_ack_command(prov: Dict[str, Any], cmd_id: int) -> None:
+    api = wp_api_base(prov)
+    key = prov.get("api_key") or ""
+    if not api or not cmd_id or not key:
+        return
+
+    headers = {"X-API-KEY": str(key), "Cache-Control": "no-store"}
+    url = api + "/command-complete"
+    try:
+        requests.post(url, json={"id": int(cmd_id)}, headers=headers, timeout=HTTP_TIMEOUT).raise_for_status()
+    except Exception as e:
+        log(f"[control] ack failed for id={cmd_id}: {e}")
+
+
+# -------------------------------------------------------------------
+# Main loop
+# -------------------------------------------------------------------
+
+def handle_command(env: Dict[str, str], cmd: Dict[str, Any]) -> None:
+    cmd_id = int(cmd.get("id") or 0)
+    action = str(cmd.get("action") or "")
+    payload = cmd.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    log(f"[control] received command id={cmd_id} action={action} payload={payload}")
+
+    try:
+        if action == "enter_kiosk":
+            start_kiosk(env)
+
+        elif action == "exit_kiosk":
+            exit_to_desktop(env)
+
+        elif action == "reload":
+            reload_browser(env)
+
+        elif action == "set_url":
+            set_url_and_reload(env, str(payload.get("url") or ""))
+
+        elif action == "update_code":
+            branch = payload.get("branch") or "main"
+            log(f"[control] update_code starting (branch={branch})")
+            subprocess.Popen(["bash", UPDATE_SCRIPT, str(branch)], env=env)
+
+        elif action == "reboot":
+            log("[control] reboot requested")
+            subprocess.call(["sudo", "reboot"])
+
+        elif action == "shutdown":
+            log("[control] shutdown requested")
+            subprocess.call(["sudo", "shutdown", "-h", "now"])
+
+        else:
+            log(f"[control] unknown action: {action}")
+
+    finally:
+        # Always ack to prevent repeats.
+        # Even if action fails, we don't want a command storm.
+        # If you want "retry on failure" later, we can add a status field + retries.
+        if cmd_id:
+            # ack handled outside; this just marks we should ack
+            pass
+
+
+def main() -> None:
+    env = build_env_for_gui()
+
+    prov = load_provision()
+    if not prov:
+        log("[control] ERROR: missing /boot/provision.json")
+        while True:
+            time.sleep(10)
+
+    # We rely on cached config to know kiosk_id
+    log(f"[control] loaded provision: {prov}")
 
     while True:
         try:
-            cmd = fetch_control_command(cfg)
+            cfg = load_cached_config()
+            cmd = wp_get_next_command(prov, cfg)
             if not cmd:
-                time.sleep(poll_s)
+                time.sleep(POLL_INTERVAL)
                 continue
 
-            ok, note = handle_action(cmd.get("action"), cmd)
-            ack(cfg, cmd.get("id"), ok, note=note)
-            time.sleep(0.5)
-        except Exception:
-            time.sleep(poll_s)
+            cmd_id = int(cmd.get("id") or 0)
+
+            # Execute
+            handle_command(env, cmd)
+
+            # Ack
+            if cmd_id:
+                wp_ack_command(prov, cmd_id)
+
+        except Exception as e:
+            log(f"[control] poll/handle error: {e}")
+            time.sleep(3)
+
 
 if __name__ == "__main__":
     main()
