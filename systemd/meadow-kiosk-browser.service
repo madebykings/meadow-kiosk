@@ -12,11 +12,17 @@ User=meadow
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/meadow/.Xauthority
 
+# Ensure kiosk mode isn't blocked by a stale stop flag
+ExecStartPre=/bin/bash -lc 'rm -f /tmp/meadow_kiosk_stop || true'
+
 # Start the watchdog loop
 ExecStart=/bin/bash /home/meadow/kiosk-browser.sh
 
-# Stop: touch stop flag and kill chromium kiosk
-ExecStop=/bin/bash -lc 'touch /tmp/meadow_kiosk_stop; pkill -f "chromium.*--kiosk" || true; pkill -f "chromium-browser.*--kiosk" || true'
+# When kiosk starts, ensure launcher is not running
+ExecStartPost=/bin/bash -lc 'systemctl --user stop meadow-launcher.service 2>/dev/null || true; pkill -f "/home/meadow/kiosk-launcher.py" 2>/dev/null || true'
+
+# Stop: request kiosk loop exit + kill kiosk chromium + kill loop if needed
+ExecStop=/bin/bash -lc 'touch /tmp/meadow_kiosk_stop; pkill -f "chromium.*--kiosk" 2>/dev/null || true; pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true; pkill -f "/home/meadow/kiosk-browser.sh" 2>/dev/null || true'
 
 Restart=on-failure
 RestartSec=3
