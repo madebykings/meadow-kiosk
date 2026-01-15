@@ -1,0 +1,22 @@
+# repo: systemd/meadow-kiosk-browser.service
+[Unit]
+Description=Meadow Kiosk Browser (Chromium watchdog loop)
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meadow
+WorkingDirectory=/home/meadow
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/meadow/.Xauthority
+ExecStart=/bin/bash /home/meadow/kiosk-browser.sh
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=60
+StartLimitBurst=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
