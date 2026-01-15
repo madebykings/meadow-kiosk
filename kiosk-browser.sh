@@ -3,6 +3,41 @@ set -e
 
 URL_FILE="/home/meadow/kiosk.url"
 DEFAULT_URL="about:blank"
+OFFLINE_URL="file:///home/meadow/offline.html"
+
+STOP_FLAG="/tmp/meadow_kiosk_stop"
+
+# Heartbeats
+UI_HEARTBEAT_FILE="${MEADOW_UI_HEARTBEAT_FILE:-/tmp/meadow_ui_heartbeat}"
+WP_HEARTBEAT_FILE="${MEADOW_WP_HEARTBEAT_FILE:-/tmp/meadow_wp_heartbeat}"
+
+# Hung UI detection (Chromium wedged / JS stalled)
+UI_HEARTBEAT_MAX_AGE="${MEADOW_UI_HEARTBEAT_MAX_AGE:-45}"
+
+# Connectivity detection (Pi can reach WordPress)
+WP_HEARTBEAT_MAX_AGE="${MEADOW_WP_HEARTBEAT_MAX_AGE:-180}"
+
+# Grace period before enforcing heartbeats (boot / network warmup)
+HEARTBEAT_GRACE="${MEADOW_HEARTBEAT_GRACE:-120}"
+WATCH_INTERVAL="${MEADOW_WATCH_INTERVAL:-5}"
+
+# Restart safety
+RESTART_WINDOW_SECS="${MEADOW_RESTART_WINDOW_SECS:-600}"   # 10 min
+MAX_RESTARTS_IN_WINDOW="${MEADOW_MAX_RESTARTS_IN_WINDOW:-10}"
+
+BACKOFF_START="${MEADOW_BACKOFF_START:-2}"
+BACKOFF_MAX="${MEADOW_BACKOFF_MAX:-60}"
+
+RESTART_LOG="/tmp/meadow_kiosk_restart_times"
+LOG_FILE="/home/meadow/state/kiosk-browser.log"
+
+log() {
+  local msg="$1"
+  local ts
+  ts="$(date -Is 2>/dev/null || date)"
+  echo "${ts} ${msg}" >> "$LOG_FILE" 2>/dev/null || true
+  echo "${msg}" >&2
+}
 
 get_url() {
   if [ -f "$URL_FILE" ]; then
@@ -12,16 +47,61 @@ get_url() {
   fi
 }
 
+touch_restart() {
+  local now
+  now=$(date +%s)
+  echo "$now" >> "$RESTART_LOG" 2>/dev/null || true
+  # prune old entries
+  if [ -f "$RESTART_LOG" ]; then
+    awk -v now="$now" -v win="$RESTART_WINDOW_SECS" 'now-$1 <= win {print $1}' "$RESTART_LOG" > "${RESTART_LOG}.tmp" 2>/dev/null || true
+    mv -f "${RESTART_LOG}.tmp" "$RESTART_LOG" 2>/dev/null || true
+  fi
+}
+
+restart_count() {
+  if [ ! -f "$RESTART_LOG" ]; then
+    echo 0
+    return
+  fi
+  wc -l < "$RESTART_LOG" 2>/dev/null | tr -d ' '
+}
+
+heartbeat_age() {
+  local f="$1"
+  local now hb
+  now=$(date +%s)
+  if [ -f "$f" ]; then
+    hb=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    echo $((now - hb))
+  else
+    echo 999999
+  fi
+}
+
 # Small delay to let X start
 sleep 2
 
+BACKOFF="$BACKOFF_START"
+
 while true; do
-  URL="$(get_url)"
-  if [ -z "$URL" ]; then
-    URL="$DEFAULT_URL"
+  if [ -f "$STOP_FLAG" ]; then
+    exit 0
   fi
 
-  # Chromium kiosk flags (tune as needed)
+  NOW=$(date +%s)
+  # Decide which URL to show: if WP offline, show offline page.
+  URL="$(get_url)"
+  if [ -z "$URL" ]; then URL="$DEFAULT_URL"; fi
+
+  # If WP heartbeat is stale beyond grace, switch to offline URL.
+  WP_AGE="$(heartbeat_age "$WP_HEARTBEAT_FILE")"
+  if [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ]; then
+    # We still allow a grace window after boot before forcing offline screen
+    # by checking for the presence of the WP heartbeat at least once.
+    URL="$OFFLINE_URL"
+  fi
+
+  # Chromium kiosk flags
   chromium-browser \
     --kiosk \
     --noerrdialogs \
@@ -29,7 +109,69 @@ while true; do
     --disable-session-crashed-bubble \
     --disable-features=TranslateUI \
     --overscroll-history-navigation=0 \
-    "$URL" || true
+    --autoplay-policy=no-user-gesture-required \
+    --allow-running-insecure-content \
+    --unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:8765 \
+    "$URL" &
+  CHROME_PID=$!
+  START_TS=$(date +%s)
 
-  sleep 1
+  # Watch loop while Chromium is running
+  while kill -0 "$CHROME_PID" 2>/dev/null; do
+    if [ -f "$STOP_FLAG" ]; then
+      kill "$CHROME_PID" 2>/dev/null || true
+      wait "$CHROME_PID" 2>/dev/null || true
+      exit 0
+    fi
+
+    NOW=$(date +%s)
+    ELAPSED=$((NOW - START_TS))
+
+    # If UI heartbeat is stale after grace, restart Chromium.
+    UI_AGE="$(heartbeat_age "$UI_HEARTBEAT_FILE")"
+    if [ "$ELAPSED" -gt "$HEARTBEAT_GRACE" ] && [ "$UI_AGE" -gt "$UI_HEARTBEAT_MAX_AGE" ]; then
+      log "[Meadow] UI heartbeat stale (${UI_AGE}s) — restarting Chromium"
+      kill "$CHROME_PID" 2>/dev/null || true
+      break
+    fi
+
+    # If WP heartbeat is stale after grace and we're not already showing offline, restart into offline.
+    WP_AGE="$(heartbeat_age "$WP_HEARTBEAT_FILE")"
+    if [ "$ELAPSED" -gt "$HEARTBEAT_GRACE" ] && [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ] && [ "$URL" != "$OFFLINE_URL" ]; then
+      log "[Meadow] WP heartbeat stale (${WP_AGE}s) — switching to offline screen"
+      kill "$CHROME_PID" 2>/dev/null || true
+      break
+    fi
+
+    sleep "$WATCH_INTERVAL"
+  done
+
+  wait "$CHROME_PID" 2>/dev/null || true
+
+  # Restart protection & backoff
+  touch_restart
+  CNT="$(restart_count)"
+
+  if [ "$CNT" -gt "$MAX_RESTARTS_IN_WINDOW" ]; then
+    log "[Meadow] Too many restarts (${CNT} in ${RESTART_WINDOW_SECS}s) — stopping kiosk and showing launcher"
+    # Stop loop and bring launcher back
+    echo "$(date -Is 2>/dev/null || date)" > "$STOP_FLAG" 2>/dev/null || true
+    python3 /home/meadow/kiosk-launcher.py >/dev/null 2>&1 || true
+    exit 0
+  fi
+
+  log "[Meadow] Chromium exited — backoff ${BACKOFF}s (restart count ${CNT}/${MAX_RESTARTS_IN_WINDOW})"
+  sleep "$BACKOFF"
+
+  # exponential backoff up to cap
+  BACKOFF=$((BACKOFF * 2))
+  if [ "$BACKOFF" -gt "$BACKOFF_MAX" ]; then
+    BACKOFF="$BACKOFF_MAX"
+  fi
+
+  # Reset backoff if the UI heartbeat is healthy (i.e. things are working again)
+  UI_AGE="$(heartbeat_age "$UI_HEARTBEAT_FILE")"
+  if [ "$UI_AGE" -le "$UI_HEARTBEAT_MAX_AGE" ]; then
+    BACKOFF="$BACKOFF_START"
+  fi
 done
