@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<labwc_config>
+
+  <keyboard>
+    <!-- Exit kiosk mode: Ctrl + Alt + E -->
+    <keybind key="C-A-e">
+      <action name="Execute">
+        <command>/home/meadow/exit-kiosk.sh</command>
+      </action>
+    </keybind>
+  </keyboard>
+
+</labwc_config>
