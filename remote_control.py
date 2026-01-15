@@ -290,11 +290,13 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
         return None
 
     params = {
-        "kiosk_id": kiosk_id,
-        "scope": CONTROL_SCOPE,
-        "key": kiosk_token,           # ✅ THIS is the fix
-        "_t": int(time.time()),
+    "kiosk_id": kiosk_id,
+    "scope": CONTROL_SCOPE,
+    "key": kiosk_token,           # kiosk key
+    "api_key": api_key,           # master API key (some WP expects this in query)
+    "_t": int(time.time()),
     }
+
 
     headers = {
         "Cache-Control": "no-store",
