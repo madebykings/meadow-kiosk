@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
-Meadow Pi API (via Cloudflare Tunnel)
+Meadow Pi API (local HTTP, published via Cloudflare Tunnel)
 
-FAST PATH (no WP dependency):
-  POST /sigma/purchase  { amount_minor:int, currency_num:str|int, reference:str }
-  POST /vend            { motor:int }
-
-OBSERVABILITY:
+FAST PATH (kiosk UI -> Pi -> hardware):
+  POST /sigma/purchase   { amount_minor:int, currency_num:str|int, reference:str }
+  POST /vend             { motor:int }
   GET  /health
   GET  /debug/config
-  GET  /heartbeat   (or POST /heartbeat)  -> updates UI heartbeat file
+  GET/POST /heartbeat
 
-ADMIN ONE-SHOT CONTROL (AUTH REQUIRED):
-  POST /admin/enter-kiosk     { kiosk_id:int, key:str }
-  POST /admin/exit-kiosk      { kiosk_id:int, key:str }
-  POST /admin/reload-kiosk    { kiosk_id:int, key:str }
-  POST /admin/set-url         { kiosk_id:int, key:str, url:str }
-  POST /admin/reboot          { kiosk_id:int, key:str }
-  POST /admin/shutdown        { kiosk_id:int, key:str }
-  POST /admin/update-code     { kiosk_id:int, key:str, branch?:str }
+ADMIN (WP backend buttons -> Pi -> systemd / one-shot WP consume):
+  POST /admin/vend-test            { kiosk_id:int, key:str, motor:int }
+  POST /admin/consume-wp-command   { kiosk_id:int, key:str, scope?:'vend'|'control' }
+  POST /admin/enter-kiosk          { kiosk_id:int, key:str }
+  POST /admin/exit-kiosk           { kiosk_id:int, key:str }      # no-op if launcher removed
+  POST /admin/reload-kiosk         { kiosk_id:int, key:str }
+  POST /admin/set-url              { kiosk_id:int, key:str, url:str }
+  POST /admin/reboot               { kiosk_id:int, key:str }
+  POST /admin/shutdown             { kiosk_id:int, key:str }
 
-Notes:
-  - Binds to 127.0.0.1 only. Cloudflare Tunnel publishes externally.
-  - FAST PATH endpoints remain unauthenticated (per your earlier request).
-  - ADMIN endpoints require the same "api_key" you already store in cached config
-    (MASTER-PROVISION-KEY1) and kiosk_id must match.
+NOTES
+- Binds to 127.0.0.1 only. Cloudflare Tunnel publishes it externally.
+- Admin endpoints REQUIRE kiosk_id + key (matches last WP config cfg.api_key).
+- This file intentionally avoids background WP command polling services.
 """
 
 from __future__ import annotations
@@ -34,10 +32,11 @@ import os
 import time
 import threading
 import traceback
-import requests
 import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional, Tuple
+
+import requests
 
 from config_remote import load_provision, fetch_config_from_wp
 from modem import get_imei
@@ -48,26 +47,33 @@ from payment.sigma.sigma_ipp_client import SigmaIppClient
 HOST = "127.0.0.1"
 PORT = 8765
 
-CACHE_PATH = "/home/meadow/kiosk.config.cache.json"
-
-# Updated by the kiosk UI (Chromium) to prove the page/JS is alive
+# Touch files for watchdog/observability
 UI_HEARTBEAT_FILE = os.environ.get("MEADOW_UI_HEARTBEAT_FILE", "/tmp/meadow_ui_heartbeat")
 WP_HEARTBEAT_FILE = os.environ.get("MEADOW_WP_HEARTBEAT_FILE", "/tmp/meadow_wp_heartbeat")
 
 # Kiosk control
-KIOSK_URL_FILE = "/home/meadow/kiosk.url"
-STOP_FLAG = "/tmp/meadow_kiosk_stop"
-UPDATE_SCRIPT = "/home/meadow/update-meadow.sh"
+KIOSK_URL_FILE = os.environ.get("MEADOW_KIOSK_URL_FILE", "/home/meadow/kiosk.url")
+STOP_FLAG = os.environ.get("MEADOW_KIOSK_STOP_FLAG", "/tmp/meadow_kiosk_stop")
 
-KIOSK_BROWSER_UNIT = "meadow-kiosk-browser.service"
-LAUNCHER_UNIT = "meadow-launcher.service"
+# systemd units (you removed launcher; leave name here but actions will be safe no-ops if absent)
+KIOSK_BROWSER_UNIT = os.environ.get("MEADOW_KIOSK_BROWSER_UNIT", "meadow-kiosk-browser.service")
+LAUNCHER_UNIT = os.environ.get("MEADOW_LAUNCHER_UNIT", "meadow-launcher.service")
 
 
-def _mask(s: str) -> str:
-    s = (s or "").strip()
-    if len(s) <= 6:
-        return "***"
-    return s[:3] + "***" + s[-2:]
+# -------------------------------------------------------------------
+# Small helpers
+# -------------------------------------------------------------------
+
+def _now_ts() -> int:
+    return int(time.time())
+
+
+def _touch(path: str) -> None:
+    try:
+        with open(path, "a"):
+            os.utime(path, None)
+    except Exception:
+        pass
 
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
@@ -96,33 +102,56 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
         return {}
 
 
-def _load_cached_config_file() -> Dict[str, Any]:
+def _git_short_hash() -> str:
     try:
-        if os.path.exists(CACHE_PATH):
-            with open(CACHE_PATH, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                return d if isinstance(d, dict) else {}
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=cwd, stderr=subprocess.DEVNULL)
+        return out.decode().strip()
+    except Exception:
+        return ""
+
+
+def _systemctl(*args: str) -> Tuple[bool, str]:
+    """
+    Runs systemctl via sudo. Your install should have sudoers for meadow.
+    Returns (ok, output_or_err).
+    """
+    try:
+        p = subprocess.run(
+            ["sudo", "systemctl", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+        )
+        ok = (p.returncode == 0)
+        return ok, (p.stdout or "")[:1200]
+    except Exception as e:
+        return False, str(e)[:400]
+
+
+def _ensure_kiosk_allowed() -> None:
+    # remove stop flag so watchdog loop continues
+    try:
+        if os.path.exists(STOP_FLAG):
+            os.remove(STOP_FLAG)
     except Exception:
         pass
-    return {}
 
 
-def _systemctl(*args: str) -> int:
-    # Uses sudo; your install.sh already set sudoers drop-in for meadow user.
-    return subprocess.call(["sudo", "systemctl", *args])
-
-
-def _touch(path: str) -> None:
+def _ensure_kiosk_stopped_flag() -> None:
     try:
-        with open(path, "a", encoding="utf-8"):
-            os.utime(path, None)
+        with open(STOP_FLAG, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
     except Exception:
         pass
 
+
+# -------------------------------------------------------------------
+# Runtime state
+# -------------------------------------------------------------------
 
 class RuntimeState:
-    """Holds last WP config + live controllers + poll status."""
-
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._cfg: Dict[str, Any] = {}
@@ -134,10 +163,10 @@ class RuntimeState:
         self._last_config_error: str = ""
         self._last_config_ts: int = 0
 
-        # Heartbeat cache (WP and UI)
         self._last_heartbeat_ok: bool = False
         self._last_heartbeat_error: str = ""
         self._last_heartbeat_ts: int = 0
+
         self._cached_imei: str = ""
 
         self._derived_motor_map: Dict[int, int] = {}
@@ -151,13 +180,13 @@ class RuntimeState:
         with self._lock:
             self._last_config_ok = bool(ok)
             self._last_config_error = (err or "")[:2000]
-            self._last_config_ts = int(time.time())
+            self._last_config_ts = _now_ts()
 
     def mark_heartbeat_result(self, ok: bool, err: str = "") -> None:
         with self._lock:
             self._last_heartbeat_ok = bool(ok)
             self._last_heartbeat_error = (err or "")[:300]
-            self._last_heartbeat_ts = int(time.time())
+            self._last_heartbeat_ts = _now_ts()
 
     def get_cached_imei(self) -> str:
         with self._lock:
@@ -235,26 +264,46 @@ class RuntimeState:
         with self._lock:
             return self._motors
 
+    def get_auth(self) -> Tuple[int, str, str]:
+        """
+        Returns (kiosk_id, api_key, domain) from last WP config.
+        """
+        with self._lock:
+            kiosk_id = int(self._cfg.get("kiosk_id") or 0)
+            key = (self._cfg.get("api_key") or self._cfg.get("key") or "").strip()
+            domain = (self._cfg.get("domain") or "").strip()
+        return kiosk_id, key, domain
+
 
 STATE = RuntimeState()
 
 
-def _git_short_hash() -> str:
-    """Return short git hash for current checkout, or empty string."""
-    try:
-        cwd = os.path.dirname(os.path.abspath(__file__))
-        out = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=cwd,
-            stderr=subprocess.DEVNULL
-        )
-        return out.decode().strip()
-    except Exception:
-        return ""
+# -------------------------------------------------------------------
+# Admin auth
+# -------------------------------------------------------------------
 
+def _auth_admin(data: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Admin endpoints require kiosk_id + key to match *last loaded WP config*.
+    """
+    want_kiosk_id, want_key, _domain = STATE.get_auth()
+    got_kiosk_id = int(data.get("kiosk_id") or 0)
+    got_key = (str(data.get("key") or "")).strip()
+
+    if not want_kiosk_id or not want_key:
+        return False, "pi_not_ready_no_auth"  # config not loaded yet
+    if got_kiosk_id != want_kiosk_id:
+        return False, "bad_kiosk_id"
+    if got_key != want_key:
+        return False, "bad_key"
+    return True, ""
+
+
+# -------------------------------------------------------------------
+# WP heartbeat + config polling
+# -------------------------------------------------------------------
 
 def _post_heartbeat(cfg: Dict[str, Any]) -> None:
-    """POST heartbeat to WP if config contains kiosk_id + api_key + domain."""
     try:
         domain = (cfg.get("domain") or "").strip()
         kiosk_id = int(cfg.get("kiosk_id") or 0)
@@ -270,11 +319,11 @@ def _post_heartbeat(cfg: Dict[str, Any]) -> None:
             if imei:
                 STATE.set_cached_imei(imei)
 
-        payload: Dict[str, Any] = {
+        payload = {
             "kiosk_id": kiosk_id,
             "key": key,
             "pi_git": _git_short_hash(),
-            "ts": int(time.time()),
+            "ts": _now_ts(),
         }
         if imei:
             payload["imei"] = imei
@@ -308,112 +357,64 @@ def _config_poll_loop() -> None:
     while True:
         try:
             cfg = fetch_config_from_wp(prov, imei=None, timeout=8)
-            if cfg and isinstance(cfg, dict):
+            if not cfg:
+                STATE.mark_poll_result(False, "empty_config")
+            else:
                 STATE.update_from_wp(cfg)
                 STATE.mark_poll_result(True, "")
-            else:
-                STATE.mark_poll_result(False, "empty_config")
         except Exception as e:
             err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
             STATE.mark_poll_result(False, err)
         time.sleep(30)
 
 
-# -----------------------------
-# ADMIN AUTH + ACTIONS
-# -----------------------------
+# -------------------------------------------------------------------
+# One-shot WP command consume helpers (NO polling)
+# -------------------------------------------------------------------
 
-def _expected_admin_kiosk_id() -> int:
-    # Prefer live state config, fall back to cached file
-    cfg = STATE.get_cfg_copy()
+def _wp_api_base(domain: str) -> str:
+    return domain.rstrip("/") + "/wp-json/meadow/v1"
+
+
+def _wp_next_command(domain: str, kiosk_id: int, key: str, scope: str) -> Optional[Dict[str, Any]]:
+    url = _wp_api_base(domain) + "/next-command"
+    params = {
+        "kiosk_id": int(kiosk_id),
+        "key": str(key),
+        "scope": str(scope or "vend"),
+        "_t": _now_ts(),
+    }
+    r = requests.get(url, params=params, timeout=10)
+    if r.status_code != 200:
+        return None
     try:
-        kid = int(cfg.get("kiosk_id") or 0)
-        if kid:
-            return kid
+        data = r.json()
     except Exception:
-        pass
-    try:
-        kid = int(_load_cached_config_file().get("kiosk_id") or 0)
-        return kid
-    except Exception:
-        return 0
+        return None
+    if isinstance(data, list):
+        if not data:
+            return None
+        data = data[0]
+    if not isinstance(data, dict) or not data.get("id"):
+        return None
+    return data
 
 
-def _expected_admin_key() -> str:
-    # Prefer live state config, fall back to cached file
-    cfg = STATE.get_cfg_copy()
-    k = (cfg.get("api_key") or cfg.get("key") or "").strip()
-    if k:
-        return k
-    k = (_load_cached_config_file().get("api_key") or "").strip()
-    return k
-
-
-def _require_admin_auth(data: Dict[str, Any]) -> Tuple[bool, str]:
-    try:
-        req_kiosk_id = int(data.get("kiosk_id") or 0)
-    except Exception:
-        req_kiosk_id = 0
-
-    req_key = str(data.get("key") or "").strip()
-
-    exp_kiosk_id = _expected_admin_kiosk_id()
-    exp_key = _expected_admin_key()
-
-    if not exp_kiosk_id or not exp_key:
-        return False, "server_not_ready"
-
-    if req_kiosk_id != exp_kiosk_id:
-        return False, "bad_kiosk_id"
-
-    if req_key != exp_key:
-        return False, "bad_key"
-
+def _wp_ack_command(domain: str, kiosk_id: int, key: str, cmd_id: int) -> Tuple[bool, str]:
+    """
+    IMPORTANT: your WP endpoint expects id + kiosk_id + key (you hit 400 when kiosk_id/key missing).
+    """
+    url = _wp_api_base(domain) + "/command-complete"
+    payload = {"id": int(cmd_id), "kiosk_id": int(kiosk_id), "key": str(key), "ts": _now_ts()}
+    r = requests.post(url, json=payload, timeout=10)
+    if r.status_code != 200:
+        return False, (r.text or "")[:400]
     return True, ""
 
 
-def _enter_kiosk() -> None:
-    # remove stop flag so watchdog loop continues
-    try:
-        if os.path.exists(STOP_FLAG):
-            os.remove(STOP_FLAG)
-    except Exception:
-        pass
-    _systemctl("stop", LAUNCHER_UNIT)
-    _systemctl("start", KIOSK_BROWSER_UNIT)
-
-
-def _exit_kiosk() -> None:
-    try:
-        with open(STOP_FLAG, "w", encoding="utf-8") as f:
-            f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
-    except Exception:
-        pass
-    _systemctl("stop", KIOSK_BROWSER_UNIT)
-    _systemctl("start", LAUNCHER_UNIT)
-
-
-def _reload_kiosk() -> None:
-    _systemctl("restart", KIOSK_BROWSER_UNIT)
-
-
-def _set_url_and_reload(url: str) -> None:
-    url = (url or "").strip()
-    if not url:
-        raise ValueError("empty_url")
-    with open(KIOSK_URL_FILE, "w", encoding="utf-8") as f:
-        f.write(url + "\n")
-    _reload_kiosk()
-
-
-def _update_code(branch: str) -> None:
-    branch = (branch or "main").strip()[:64]
-    subprocess.Popen(["bash", UPDATE_SCRIPT, branch])
-
-
-# -----------------------------
-# HTTP HANDLER
-# -----------------------------
+# -------------------------------------------------------------------
+# HTTP handler
+# -------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
@@ -456,52 +457,36 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/vend"):
             return self._handle_vend()
 
-        # ---- ADMIN (auth required) ----
-        if self.path.startswith("/admin/"):
-            return self._handle_admin()
+        # Admin endpoints
+        if self.path.startswith("/admin/vend-test"):
+            return self._handle_admin_vend_test()
+
+        if self.path.startswith("/admin/consume-wp-command"):
+            return self._handle_admin_consume_wp_command()
+
+        if self.path.startswith("/admin/enter-kiosk"):
+            return self._handle_admin_enter_kiosk()
+
+        if self.path.startswith("/admin/exit-kiosk"):
+            return self._handle_admin_exit_kiosk()
+
+        if self.path.startswith("/admin/reload-kiosk"):
+            return self._handle_admin_reload_kiosk()
+
+        if self.path.startswith("/admin/set-url"):
+            return self._handle_admin_set_url()
+
+        if self.path.startswith("/admin/reboot"):
+            return self._handle_admin_reboot()
+
+        if self.path.startswith("/admin/shutdown"):
+            return self._handle_admin_shutdown()
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
-    def _handle_admin(self) -> None:
-        data = _read_json(self)
-        ok, err = _require_admin_auth(data)
-        if not ok:
-            return _json_response(self, 403, {"ok": False, "error": err})
-
-        try:
-            if self.path.startswith("/admin/enter-kiosk"):
-                _enter_kiosk()
-                return _json_response(self, 200, {"ok": True})
-
-            if self.path.startswith("/admin/exit-kiosk"):
-                _exit_kiosk()
-                return _json_response(self, 200, {"ok": True})
-
-            if self.path.startswith("/admin/reload-kiosk"):
-                _reload_kiosk()
-                return _json_response(self, 200, {"ok": True})
-
-            if self.path.startswith("/admin/set-url"):
-                url = str(data.get("url") or "")
-                _set_url_and_reload(url)
-                return _json_response(self, 200, {"ok": True})
-
-            if self.path.startswith("/admin/reboot"):
-                subprocess.Popen(["sudo", "reboot"])
-                return _json_response(self, 200, {"ok": True})
-
-            if self.path.startswith("/admin/shutdown"):
-                subprocess.Popen(["sudo", "shutdown", "-h", "now"])
-                return _json_response(self, 200, {"ok": True})
-
-            if self.path.startswith("/admin/update-code"):
-                branch = str(data.get("branch") or "main")
-                _update_code(branch)
-                return _json_response(self, 200, {"ok": True, "branch": branch})
-
-            return _json_response(self, 404, {"ok": False, "error": "not_found"})
-        except Exception as e:
-            return _json_response(self, 500, {"ok": False, "error": str(e)})
+    # ----------------------------
+    # Sigma purchase
+    # ----------------------------
 
     def _handle_sigma_purchase(self) -> None:
         data = _read_json(self)
@@ -557,11 +542,15 @@ class Handler(BaseHTTPRequestHandler):
 
                 return _json_response(self, 200, {"ok": True, **payload})
 
-            except Exception as e:
-                last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
+            except Exception:
+                last_err = "".join(traceback.format_exc())[-2000:]
                 continue
 
         return _json_response(self, 502, {"ok": False, "error": "sigma_failed", "detail": last_err})
+
+    # ----------------------------
+    # Vend (fast path)
+    # ----------------------------
 
     def _handle_vend(self) -> None:
         data = _read_json(self)
@@ -580,16 +569,229 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return _json_response(self, 500, {"ok": False, "success": False, "error": str(e)})
 
+    # ----------------------------
+    # Admin: vend test (one-shot)
+    # ----------------------------
+
+    def _handle_admin_vend_test(self) -> None:
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        try:
+            motor = int(data.get("motor") or 0)
+        except Exception:
+            motor = 0
+        if motor <= 0:
+            return _json_response(self, 400, {"ok": False, "error": "missing_motor"})
+
+        controller = STATE.get_motors()
+        if controller is None:
+            return _json_response(self, 503, {"ok": False, "error": "motors_not_loaded"})
+
+        try:
+            controller.vend(motor)
+            return _json_response(self, 200, {"ok": True, "motor": motor})
+        except Exception as e:
+            return _json_response(self, 500, {"ok": False, "motor": motor, "error": str(e)})
+
+    # ----------------------------
+    # Admin: consume one queued WP command and ack it (no polling)
+    # ----------------------------
+
+    def _handle_admin_consume_wp_command(self) -> None:
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        kiosk_id, key, domain = STATE.get_auth()
+        if not domain:
+            return _json_response(self, 503, {"ok": False, "error": "no_domain"})
+
+        scope = str(data.get("scope") or "vend").strip().lower()
+        if scope not in ("vend", "control"):
+            scope = "vend"
+
+        cmd = _wp_next_command(domain, kiosk_id, key, scope)
+        if not cmd:
+            return _json_response(self, 200, {"ok": True, "found": False})
+
+        cmd_id = int(cmd.get("id") or 0)
+        action = str(cmd.get("action") or "")
+        payload = cmd.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        exec_ok = False
+        exec_err = ""
+
+        try:
+            # vend commands
+            if action in ("vend", "spin_motor"):
+                motor = int(payload.get("motor") or cmd.get("motor") or 0)
+                if motor <= 0:
+                    raise ValueError("missing motor")
+                controller = STATE.get_motors()
+                if controller is None:
+                    raise RuntimeError("motors_not_loaded")
+                controller.vend(motor)
+                exec_ok = True
+
+            # control commands (minimal set here; you can expand if desired)
+            elif action == "enter_kiosk":
+                _ensure_kiosk_allowed()
+                ok1, out1 = _systemctl("start", KIOSK_BROWSER_UNIT)
+                exec_ok = ok1
+                exec_err = "" if ok1 else out1
+
+            elif action == "reload":
+                _ensure_kiosk_allowed()
+                ok1, out1 = _systemctl("restart", KIOSK_BROWSER_UNIT)
+                exec_ok = ok1
+                exec_err = "" if ok1 else out1
+
+            elif action == "set_url":
+                url = str(payload.get("url") or "").strip()
+                if not url:
+                    raise ValueError("missing url")
+                try:
+                    with open(KIOSK_URL_FILE, "w", encoding="utf-8") as f:
+                        f.write(url + "\n")
+                except Exception as e:
+                    raise RuntimeError(f"write kiosk.url failed: {e}")
+                _ensure_kiosk_allowed()
+                ok1, out1 = _systemctl("restart", KIOSK_BROWSER_UNIT)
+                exec_ok = ok1
+                exec_err = "" if ok1 else out1
+
+            elif action == "reboot":
+                subprocess.Popen(["sudo", "reboot"])
+                exec_ok = True
+
+            elif action == "shutdown":
+                subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+                exec_ok = True
+
+            else:
+                # unknown action: we still ack to prevent queue jams
+                exec_ok = True
+
+        except Exception as e:
+            exec_ok = False
+            exec_err = str(e)
+
+        ack_ok, ack_err = _wp_ack_command(domain, kiosk_id, key, cmd_id)
+
+        return _json_response(self, 200, {
+            "ok": True,
+            "found": True,
+            "cmd": {"id": cmd_id, "action": action, "scope": scope},
+            "exec_ok": exec_ok,
+            "exec_err": exec_err,
+            "ack_ok": ack_ok,
+            "ack_err": ack_err,
+        })
+
+    # ----------------------------
+    # Admin: kiosk control (systemd)
+    # ----------------------------
+
+    def _handle_admin_enter_kiosk(self) -> None:
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        _ensure_kiosk_allowed()
+        ok1, out1 = _systemctl("start", KIOSK_BROWSER_UNIT)
+        return _json_response(self, 200 if ok1 else 500, {"ok": ok1, "unit": KIOSK_BROWSER_UNIT, "out": out1})
+
+    def _handle_admin_exit_kiosk(self) -> None:
+        """
+        You said you've removed launcher service too.
+        This will stop the kiosk browser + set stop flag; it will NOT start launcher.
+        """
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        _ensure_kiosk_stopped_flag()
+        ok1, out1 = _systemctl("stop", KIOSK_BROWSER_UNIT)
+
+        # Try to stop launcher if it exists (harmless if missing)
+        ok2, out2 = _systemctl("stop", LAUNCHER_UNIT)
+
+        return _json_response(self, 200, {
+            "ok": True,
+            "stopped": {KIOSK_BROWSER_UNIT: ok1, LAUNCHER_UNIT: ok2},
+            "out": {"browser": out1, "launcher": out2},
+            "note": "launcher not started (removed on this machine)",
+        })
+
+    def _handle_admin_reload_kiosk(self) -> None:
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        _ensure_kiosk_allowed()
+        ok1, out1 = _systemctl("restart", KIOSK_BROWSER_UNIT)
+        return _json_response(self, 200 if ok1 else 500, {"ok": ok1, "unit": KIOSK_BROWSER_UNIT, "out": out1})
+
+    def _handle_admin_set_url(self) -> None:
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        url = str(data.get("url") or "").strip()
+        if not url:
+            return _json_response(self, 400, {"ok": False, "error": "missing_url"})
+
+        try:
+            with open(KIOSK_URL_FILE, "w", encoding="utf-8") as f:
+                f.write(url + "\n")
+        except Exception as e:
+            return _json_response(self, 500, {"ok": False, "error": "write_failed", "detail": str(e)[:200]})
+
+        _ensure_kiosk_allowed()
+        ok1, out1 = _systemctl("restart", KIOSK_BROWSER_UNIT)
+        return _json_response(self, 200 if ok1 else 500, {"ok": ok1, "url": url, "out": out1})
+
+    def _handle_admin_reboot(self) -> None:
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        subprocess.Popen(["sudo", "reboot"])
+        return _json_response(self, 200, {"ok": True})
+
+    def _handle_admin_shutdown(self) -> None:
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+        return _json_response(self, 200, {"ok": True})
+
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
+
+# -------------------------------------------------------------------
+# main
+# -------------------------------------------------------------------
 
 def main() -> None:
     threading.Thread(target=_config_poll_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     httpd = HTTPServer((HOST, PORT), Handler)
     print(f"[pi_api] listening on http://{HOST}:{PORT}")
-    print(f"[pi_api] admin expects kiosk_id={_expected_admin_kiosk_id()} key={_mask(_expected_admin_key())}")
     httpd.serve_forever()
 
 
