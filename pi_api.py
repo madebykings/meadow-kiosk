@@ -2,14 +2,18 @@
 """Meadow Pi API (via Cloudflare Tunnel)
 
 Endpoints (JSON):
-  POST /sigma/purchase  { amount_minor:int, currency_num:str|int, reference:str }
-  POST /vend            { motor:int }
+  POST /sigma/purchase            { amount_minor:int, currency_num:str|int, reference:str }
+  POST /vend                      { motor:int }
+  POST /admin/vend-test           { kiosk_id:int, key:str, motor:int }
+  POST /admin/consume-wp-command  { kiosk_id:int, key:str, scope?:'vend'|'control' }  # one-shot (no polling)
+
   GET  /health
-  GET  /debug/config    (shows last WP config + derived maps)
+  GET  /debug/config              (shows last WP config + derived maps)
+  GET/POST /heartbeat             (UI watchdog touch)
 
 Notes:
   - Binds to 127.0.0.1 only. Cloudflare Tunnel publishes it externally.
-  - No header/secret auth (per your request).
+  - Admin endpoints REQUIRE kiosk_id + key (cfg.api_key).
 """
 
 from __future__ import annotations
@@ -38,6 +42,9 @@ UI_HEARTBEAT_FILE = os.environ.get("MEADOW_UI_HEARTBEAT_FILE", "/tmp/meadow_ui_h
 WP_HEARTBEAT_FILE = os.environ.get("MEADOW_WP_HEARTBEAT_FILE", "/tmp/meadow_wp_heartbeat")
 
 
+# -------------------------------------------------------------------
+# HTTP helpers
+# -------------------------------------------------------------------
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -64,6 +71,18 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
+def _touch(path: str) -> None:
+    try:
+        with open(path, "a"):
+            os.utime(path, None)
+    except Exception:
+        pass
+
+
+# -------------------------------------------------------------------
+# Runtime state
+# -------------------------------------------------------------------
 
 class RuntimeState:
     """Holds last WP config + live controllers + poll status."""
@@ -188,6 +207,17 @@ class RuntimeState:
         with self._lock:
             return self._motors
 
+    def get_auth(self) -> Tuple[int, str, str]:
+        """
+        Returns (kiosk_id, api_key, domain) from last WP config.
+        """
+        with self._lock:
+            kiosk_id = int(self._cfg.get("kiosk_id") or 0)
+            key = (self._cfg.get("api_key") or self._cfg.get("key") or "").strip()
+            domain = (self._cfg.get("domain") or "").strip()
+        return kiosk_id, key, domain
+
+
 def _git_short_hash() -> str:
     """Return short git hash for current checkout, or empty string."""
     try:
@@ -197,6 +227,35 @@ def _git_short_hash() -> str:
     except Exception:
         return ""
 
+
+STATE = RuntimeState()
+
+
+# -------------------------------------------------------------------
+# Auth for admin endpoints
+# -------------------------------------------------------------------
+
+def _auth_admin(data: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Admin endpoints require kiosk_id + key to match config cache.
+    """
+    want_kiosk_id, want_key, _domain = STATE.get_auth()
+    got_kiosk_id = int(data.get("kiosk_id") or 0)
+    got_key = (str(data.get("key") or "")).strip()
+
+    if not want_kiosk_id or not want_key:
+        return False, "pi_not_ready_no_auth"  # config not loaded yet
+    if got_kiosk_id != want_kiosk_id:
+        return False, "bad_kiosk_id"
+    if got_key != want_key:
+        return False, "bad_key"
+    return True, ""
+
+
+# -------------------------------------------------------------------
+# WP heartbeat + config polling
+# -------------------------------------------------------------------
+
 def _post_heartbeat(cfg: Dict[str, Any]) -> None:
     """POST heartbeat to WP if config contains kiosk_id + api_key + domain."""
     try:
@@ -204,7 +263,6 @@ def _post_heartbeat(cfg: Dict[str, Any]) -> None:
         kiosk_id = int(cfg.get("kiosk_id") or 0)
         key = (cfg.get("api_key") or "").strip()
         if not domain or not kiosk_id or not key:
-            # can't heartbeat yet
             return
 
         url = domain.rstrip("/") + "/wp-json/meadow/v1/kiosk-heartbeat"
@@ -229,23 +287,17 @@ def _post_heartbeat(cfg: Dict[str, Any]) -> None:
             STATE.mark_heartbeat_result(False, f"HTTP {r.status_code}")
         else:
             STATE.mark_heartbeat_result(True, "")
-            # Touch WP heartbeat file so the kiosk browser can detect connectivity
-            try:
-                with open(WP_HEARTBEAT_FILE, "a"):
-                    os.utime(WP_HEARTBEAT_FILE, None)
-            except Exception:
-                pass
+            _touch(WP_HEARTBEAT_FILE)
+
     except Exception as e:
         STATE.mark_heartbeat_result(False, str(e)[:200])
 
+
 def _heartbeat_loop() -> None:
-    # heartbeat every 60s
     while True:
         cfg = STATE.get_cfg_copy()
         _post_heartbeat(cfg)
         time.sleep(60)
-
-STATE = RuntimeState()
 
 
 def _config_poll_loop() -> None:
@@ -255,7 +307,7 @@ def _config_poll_loop() -> None:
     except Exception as e:
         print("[pi_api] FAILED to load provision.json")
         print("".join(traceback.format_exception(type(e), e, e.__traceback__)))
-        return  # no point continuing
+        return
 
     while True:
         try:
@@ -264,16 +316,72 @@ def _config_poll_loop() -> None:
 
             if not cfg:
                 print("[pi_api] poll returned empty config")
+                STATE.mark_poll_result(False, "empty_config")
             else:
                 print("[pi_api] config received OK")
                 STATE.update_from_wp(cfg)
+                STATE.mark_poll_result(True, "")
 
         except Exception as e:
             err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
             print("[pi_api] CONFIG POLL FAILED:")
             print(err)
+            STATE.mark_poll_result(False, err)
 
         time.sleep(30)
+
+
+# -------------------------------------------------------------------
+# One-shot WP command consume (NO polling)
+# -------------------------------------------------------------------
+
+def _wp_api_base(domain: str) -> str:
+    return domain.rstrip("/") + "/wp-json/meadow/v1"
+
+
+def _wp_next_command(domain: str, kiosk_id: int, key: str, scope: str) -> Optional[Dict[str, Any]]:
+    """
+    Calls WP /next-command with ?kiosk_id=&key=&scope=
+    Returns dict or None.
+    """
+    url = _wp_api_base(domain) + "/next-command"
+    params = {
+        "kiosk_id": int(kiosk_id),
+        "key": str(key),
+        "scope": str(scope or "vend"),
+        "_t": int(time.time()),
+    }
+    r = requests.get(url, params=params, timeout=10)
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    if isinstance(data, list):
+        if not data:
+            return None
+        data = data[0]
+    if not isinstance(data, dict) or not data.get("id"):
+        return None
+    return data
+
+
+def _wp_ack_command(domain: str, kiosk_id: int, key: str, cmd_id: int) -> Tuple[bool, str]:
+    """
+    Calls WP /command-complete with JSON {id,kiosk_id,key}
+    """
+    url = _wp_api_base(domain) + "/command-complete"
+    payload = {"id": int(cmd_id), "kiosk_id": int(kiosk_id), "key": str(key), "ts": int(time.time())}
+    r = requests.post(url, json=payload, timeout=10)
+    if r.status_code != 200:
+        return False, (r.text or "")[:400]
+    return True, ""
+
+
+# -------------------------------------------------------------------
+# HTTP handler
+# -------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
@@ -300,23 +408,14 @@ class Handler(BaseHTTPRequestHandler):
             return _json_response(self, 200, STATE.snapshot())
 
         if self.path.startswith("/heartbeat"):
-            # Touch UI heartbeat file
-            try:
-                with open(UI_HEARTBEAT_FILE, "a"):
-                    os.utime(UI_HEARTBEAT_FILE, None)
-            except Exception:
-                pass
+            _touch(UI_HEARTBEAT_FILE)
             return _json_response(self, 200, {"ok": True})
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
         if self.path.startswith("/heartbeat"):
-            try:
-                with open(UI_HEARTBEAT_FILE, "a"):
-                    os.utime(UI_HEARTBEAT_FILE, None)
-            except Exception:
-                pass
+            _touch(UI_HEARTBEAT_FILE)
             return _json_response(self, 200, {"ok": True})
 
         if self.path.startswith("/sigma/purchase"):
@@ -324,6 +423,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/vend"):
             return self._handle_vend()
+
+        if self.path.startswith("/admin/vend-test"):
+            return self._handle_admin_vend_test()
+
+        if self.path.startswith("/admin/consume-wp-command"):
+            return self._handle_admin_consume_wp_command()
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
@@ -403,6 +508,98 @@ class Handler(BaseHTTPRequestHandler):
             return _json_response(self, 200, {"ok": True, "success": True})
         except Exception as e:
             return _json_response(self, 500, {"ok": False, "success": False, "error": str(e)})
+
+    def _handle_admin_vend_test(self) -> None:
+        """
+        One-shot vend with auth. This replaces the polling vend-poller service.
+        """
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        try:
+            motor = int(data.get("motor") or 0)
+        except Exception:
+            motor = 0
+        if motor <= 0:
+            return _json_response(self, 400, {"ok": False, "error": "missing_motor"})
+
+        controller = STATE.get_motors()
+        if controller is None:
+            return _json_response(self, 503, {"ok": False, "error": "motors_not_loaded"})
+
+        try:
+            controller.vend(motor)
+            return _json_response(self, 200, {"ok": True, "motor": motor})
+        except Exception as e:
+            return _json_response(self, 500, {"ok": False, "motor": motor, "error": str(e)})
+
+    def _handle_admin_consume_wp_command(self) -> None:
+        """
+        One-shot:
+          - fetch ONE queued command from WP (/next-command?kiosk_id&key&scope=vend/control)
+          - if vend: execute locally
+          - ack back to WP (/command-complete)
+
+        This gives you a "WP button works" path without any background polling daemon.
+        """
+        data = _read_json(self)
+        ok, err = _auth_admin(data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+
+        kiosk_id, key, domain = STATE.get_auth()
+        if not domain:
+            return _json_response(self, 503, {"ok": False, "error": "no_domain"})
+
+        scope = str(data.get("scope") or "vend").strip().lower()
+        if scope not in ("vend", "control"):
+            scope = "vend"
+
+        cmd = _wp_next_command(domain, kiosk_id, key, scope)
+        if not cmd:
+            return _json_response(self, 200, {"ok": True, "found": False})
+
+        cmd_id = int(cmd.get("id") or 0)
+        action = str(cmd.get("action") or "")
+        payload = cmd.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        # Execute known actions (vend is most important)
+        exec_ok = False
+        exec_err = ""
+
+        try:
+            if action in ("vend", "spin_motor"):
+                motor = int(payload.get("motor") or cmd.get("motor") or 0)
+                if motor <= 0:
+                    raise ValueError("missing motor")
+                controller = STATE.get_motors()
+                if controller is None:
+                    raise RuntimeError("motors_not_loaded")
+                controller.vend(motor)
+                exec_ok = True
+
+            else:
+                # For now we don't execute control actions here (remote_control.py already does)
+                exec_ok = True
+        except Exception as e:
+            exec_ok = False
+            exec_err = str(e)
+
+        ack_ok, ack_err = _wp_ack_command(domain, kiosk_id, key, cmd_id)
+
+        return _json_response(self, 200, {
+            "ok": True,
+            "found": True,
+            "cmd": {"id": cmd_id, "action": action, "scope": scope},
+            "exec_ok": exec_ok,
+            "exec_err": exec_err,
+            "ack_ok": ack_ok,
+            "ack_err": ack_err,
+        })
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
