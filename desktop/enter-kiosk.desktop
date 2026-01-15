@@ -2,7 +2,7 @@
 Type=Application
 Name=Enter Meadow Kiosk
 Comment=Launch Meadow kiosk mode (fullscreen)
-Exec=bash -lc 'rm -f /tmp/meadow_kiosk_stop; /home/meadow/kiosk-browser.sh >> /home/meadow/state/enter-kiosk.log 2>&1'
+Exec=bash -lc 'sudo systemctl start meadow-kiosk-browser.service'
 Icon=video-display
 Terminal=false
 Categories=Utility;
