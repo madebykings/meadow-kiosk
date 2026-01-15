@@ -15,7 +15,7 @@ ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git reset --hard ori
 ExecStart=/usr/bin/python3 /home/meadow/meadow-kiosk/pi_api.py
 
 # Resilience
-Restart=always
+Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=60
 StartLimitBurst=10
