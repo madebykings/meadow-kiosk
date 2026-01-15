@@ -12,19 +12,32 @@ def api_base(cfg):
 
 def _get_key(cfg):
     """
-    Support both legacy/new config shapes.
+    Support both legacy and current config shapes.
     Prefer api_key, fall back to key.
     """
-    k = (cfg.get("api_key") or cfg.get("key") or "").strip()
-    return k
+    return (cfg.get("api_key") or cfg.get("key") or "").strip()
 
 
-def _mask_key(k: str) -> str:
-    if not k:
+def _mask(val):
+    if not val:
         return "(missing)"
-    if len(k) <= 6:
-        return k[0] + "***"
-    return k[:3] + "***" + k[-2:]
+    if len(val) <= 6:
+        return val[0] + "***"
+    return val[:3] + "***" + val[-2:]
+
+
+def _auth_params(cfg):
+    """
+    Build auth params consistently for all WP calls.
+    """
+    p = {
+        "kiosk_id": cfg.get("kiosk_id"),
+        "key": _get_key(cfg),
+        "_t": int(time.time()),
+    }
+    if cfg.get("token"):
+        p["token"] = cfg["token"]
+    return p
 
 
 def next_command(cfg, scope=None):
@@ -37,23 +50,22 @@ def next_command(cfg, scope=None):
       - {} or [] or None for no commands
     """
     url = api_base(cfg) + "/next-command"
+    params = _auth_params(cfg)
 
-    key = _get_key(cfg)
-    params = {
-        "kiosk_id": cfg["kiosk_id"],
-        "key": key,
-    }
     if scope:
         params["scope"] = scope
 
-    if not params["kiosk_id"] or not key:
-        print(f"next_command: missing kiosk_id or key (kiosk_id={params.get('kiosk_id')}, key={_mask_key(key)})")
+    if not params.get("kiosk_id") or not params.get("key"):
+        print(
+            f"next_command: missing auth "
+            f"(kiosk_id={params.get('kiosk_id')}, key={_mask(params.get('key'))})"
+        )
         return None
 
     try:
         r = requests.get(url, params=params, timeout=5)
         if r.status_code >= 400:
-            print(f"next_command HTTP error: {r.status_code} body={r.text}")
+            print(f"next_command HTTP {r.status_code}: {r.text}")
             return None
     except Exception as e:
         print("next_command: request failed:", e)
@@ -79,10 +91,9 @@ def next_command(cfg, scope=None):
         return None
 
     motor = data.get("motor")
-    if not motor:
+    if motor is None:
         return None
 
-    # Convert motor to int
     try:
         data["motor"] = int(motor)
     except Exception:
@@ -97,23 +108,21 @@ def ack_command(cfg, cmd_id, success=True):
     Notify WP that a command was processed.
     """
     url = api_base(cfg) + "/command-complete"
-
-    key = _get_key(cfg)
     payload = {
-        "id": cmd_id,
-        "key": key,
+        "id": int(cmd_id),
         "success": bool(success),
         "ts": int(time.time()),
     }
+    payload.update(_auth_params(cfg))
 
-    if not key:
+    if not payload.get("key"):
         print(f"ack_command: missing key (cmd_id={cmd_id})")
         return
 
     try:
         r = requests.post(url, json=payload, timeout=5)
         if r.status_code >= 400:
-            print(f"ack_command HTTP error: {r.status_code} body={r.text}")
+            print(f"ack_command HTTP {r.status_code}: {r.text}")
     except Exception as e:
         print("ack_command: error:", e)
 
@@ -123,25 +132,23 @@ def heartbeat(cfg, imei=None):
     Regular heartbeat to WP with basic info.
     """
     url = api_base(cfg) + "/kiosk-heartbeat"
-
-    key = _get_key(cfg)
     payload = {
-        "kiosk_id": cfg["kiosk_id"],
-        "key": key,
         "pi_git": (cfg.get("pi_git") or cfg.get("config_version")),
         "ts": int(time.time()),
     }
+    payload.update(_auth_params(cfg))
+
     if imei:
         payload["imei"] = imei
 
-    if not key:
+    if not payload.get("key"):
         print("heartbeat: missing key")
         return
 
     try:
         r = requests.post(url, json=payload, timeout=5)
         if r.status_code >= 400:
-            print(f"heartbeat HTTP error: {r.status_code} body={r.text}")
+            print(f"heartbeat HTTP {r.status_code}: {r.text}")
     except Exception as e:
         print("heartbeat: error:", e)
 
@@ -151,23 +158,22 @@ def set_screen_mode(cfg, mode, order_id=None):
     mode: 'browse', 'ads', 'vending', 'thankyou', 'error'
     """
     url = api_base(cfg) + "/kiosk-screen"
-
-    key = _get_key(cfg)
     payload = {
-        "kiosk_id": cfg["kiosk_id"],
-        "key": key,
         "mode": mode,
+        "ts": int(time.time()),
     }
+    payload.update(_auth_params(cfg))
+
     if order_id is not None:
         payload["order_id"] = int(order_id)
 
-    if not key:
+    if not payload.get("key"):
         print("set_screen_mode: missing key")
         return
 
     try:
         r = requests.post(url, json=payload, timeout=5)
         if r.status_code >= 400:
-            print(f"set_screen_mode HTTP error: {r.status_code} body={r.text}")
+            print(f"set_screen_mode HTTP {r.status_code}: {r.text}")
     except Exception as e:
         print("set_screen_mode: error:", e)
