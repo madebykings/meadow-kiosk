@@ -8,6 +8,8 @@
 # - Dedupe commands by id
 # - Uses systemd as source of truth (no duplicate processes)
 # - Always tries to ack (even if already handled)
+# - Auth sent as query param key=... (matches WP plugin expectations)
+# - Backoff on repeated failures (prevents "death by 1000 polls")
 
 import json
 import os
@@ -41,6 +43,15 @@ CONTROL_SCOPE = "control"
 # systemd units
 KIOSK_BROWSER_UNIT = "meadow-kiosk-browser.service"
 LAUNCHER_UNIT = "meadow-launcher.service"
+
+
+def _mask(val: str) -> str:
+    v = (val or "").strip()
+    if not v:
+        return "(missing)"
+    if len(v) <= 6:
+        return v[0] + "***"
+    return v[:3] + "***" + v[-2:]
 
 
 def log(msg: str) -> None:
@@ -110,35 +121,30 @@ def systemctl(*args: str) -> int:
 
 
 def enter_kiosk() -> None:
-    # remove stop flag so watchdog loop continues
     try:
         if os.path.exists(STOP_FLAG):
             os.remove(STOP_FLAG)
     except Exception:
         pass
 
-    # stop launcher, start kiosk browser watchdog
     systemctl("stop", LAUNCHER_UNIT)
     systemctl("start", KIOSK_BROWSER_UNIT)
     log("[control] enter_kiosk -> start meadow-kiosk-browser, stop meadow-launcher")
 
 
 def exit_kiosk() -> None:
-    # create stop flag so kiosk loop exits cleanly if script honors it
     try:
         with open(STOP_FLAG, "w", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
     except Exception:
         pass
 
-    # stop kiosk browser, start launcher
     systemctl("stop", KIOSK_BROWSER_UNIT)
     systemctl("start", LAUNCHER_UNIT)
     log("[control] exit_kiosk -> stop meadow-kiosk-browser, start meadow-launcher")
 
 
 def reload_kiosk() -> None:
-    # restart kiosk browser watchdog (if inactive, it will start)
     systemctl("restart", KIOSK_BROWSER_UNIT)
     log("[control] reload -> restart meadow-kiosk-browser")
 
@@ -164,26 +170,36 @@ def set_url_and_reload(url: str) -> None:
 # WP polling + acknowledgements
 # -------------------------------------------------------------------
 
+def _get_wp_key(prov: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    """
+    Prefer provision api_key (master), fall back to cached config keys.
+    """
+    return (prov.get("api_key") or cfg.get("api_key") or cfg.get("key") or "").strip()
+
+
 def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     api = wp_api_base(prov)
     kiosk_id = int(cfg.get("kiosk_id") or 0)
+    key = _get_wp_key(prov, cfg)
 
-    # IMPORTANT:
-    # Control channel should use the "master provision key" (your prov api_key),
-    # NOT the per-unit kiosk_token.
-    api_key = (prov.get("api_key") or "").strip()
-
-    if not api or not kiosk_id or not api_key:
+    if not api or not kiosk_id or not key:
+        log(f"[control] missing auth for next-command (kiosk_id={kiosk_id}, key={_mask(key)})")
         return None
 
     params = {
         "kiosk_id": kiosk_id,
+        "key": key,                 # ✅ WP expects key in params
         "scope": CONTROL_SCOPE,
         "_t": int(time.time()),
     }
 
+    # Optional token, if your endpoint expects it (harmless if ignored)
+    token = (cfg.get("token") or prov.get("token") or "").strip()
+    if token:
+        params["token"] = token
+
     headers = {
-        "X-API-KEY": api_key,
+        "X-API-KEY": key,           # keep for future / debugging
         "Cache-Control": "no-store",
     }
 
@@ -191,7 +207,6 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
 
     r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
     if r.status_code >= 400:
-        # log body to help debug plugin auth mismatches
         body = (r.text or "")[:400]
         log(f"[control] next-command HTTP error: {r.status_code} {r.reason} body={body}")
     r.raise_for_status()
@@ -204,16 +219,21 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
     return data
 
 
-def wp_ack_command(prov: Dict[str, Any], cmd_id: int) -> None:
+def wp_ack_command(prov: Dict[str, Any], cfg: Dict[str, Any], cmd_id: int) -> None:
     api = wp_api_base(prov)
-    api_key = (prov.get("api_key") or "").strip()
-    if not api or not cmd_id or not api_key:
+    key = _get_wp_key(prov, cfg)
+    if not api or not cmd_id or not key:
         return
 
-    headers = {"X-API-KEY": api_key, "Cache-Control": "no-store"}
     url = api + "/command-complete"
+
+    # ✅ Send key in JSON too (some WP handlers validate it there)
+    payload = {"id": int(cmd_id), "key": key, "ts": int(time.time())}
+
+    headers = {"X-API-KEY": key, "Cache-Control": "no-store"}
+
     try:
-        r = requests.post(url, json={"id": int(cmd_id)}, headers=headers, timeout=HTTP_TIMEOUT)
+        r = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
         if r.status_code >= 400:
             body = (r.text or "")[:400]
             log(f"[control] ack HTTP error: {r.status_code} {r.reason} body={body}")
@@ -271,23 +291,29 @@ def main() -> None:
         while True:
             time.sleep(10)
 
-    log(f"[control] loaded provision: {prov}")
+    # Don't print secrets in logs
+    log(f"[control] provision loaded (domain={prov.get('domain')}, api_key={_mask(str(prov.get('api_key') or ''))})")
+
+    backoff = 0.0
+    failures = 0
 
     while True:
         try:
             cfg = load_cached_config()
+
             cmd = wp_get_next_command(prov, cfg)
             if not cmd:
+                failures = 0
+                backoff = 0.0
                 time.sleep(POLL_INTERVAL)
                 continue
 
             cmd_id = int(cmd.get("id") or 0)
             last_id = read_last_cmd_id()
 
-            # If already handled, do NOT execute again—just try ack.
             if cmd_id and cmd_id <= last_id:
                 log(f"[control] cmd id={cmd_id} already handled (last={last_id}); trying ack only")
-                wp_ack_command(prov, cmd_id)
+                wp_ack_command(prov, cfg, cmd_id)
                 time.sleep(POLL_INTERVAL)
                 continue
 
@@ -295,11 +321,16 @@ def main() -> None:
 
             if cmd_id:
                 write_last_cmd_id(cmd_id)
-                wp_ack_command(prov, cmd_id)
+                wp_ack_command(prov, cfg, cmd_id)
+
+            failures = 0
+            backoff = 0.0
 
         except Exception as e:
-            log(f"[control] poll/handle error: {e}")
-            time.sleep(3)
+            failures += 1
+            backoff = min(30.0, 2.0 * failures)  # 2s,4s,6s... up to 30s
+            log(f"[control] poll/handle error: {e} (failures={failures}, backoff={backoff}s)")
+            time.sleep(backoff if backoff else 3.0)
 
 
 if __name__ == "__main__":
