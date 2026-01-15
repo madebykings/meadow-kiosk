@@ -2,7 +2,7 @@
 Type=Application
 Name=Exit Meadow Kiosk
 Comment=Exit Meadow kiosk mode and return to desktop
-Exec=/home/meadow/exit-kiosk.sh
+Exec=bash -lc '/home/meadow/exit-kiosk.sh >> /home/meadow/state/exit-kiosk.log 2>&1'
 Icon=system-shutdown
 Terminal=false
 Categories=Utility;
