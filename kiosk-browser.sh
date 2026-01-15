@@ -9,6 +9,9 @@ STOP_FLAG="/tmp/meadow_kiosk_stop"
 
 # Heartbeats
 UI_HEARTBEAT_FILE="${MEADOW_UI_HEARTBEAT_FILE:-/tmp/meadow_ui_heartbeat}"
+log "[Meadow] Using UI_HEARTBEAT_FILE=$UI_HEARTBEAT_FILE"
+log "[Meadow] Using WP_HEARTBEAT_FILE=$WP_HEARTBEAT_FILE"
+
 WP_HEARTBEAT_FILE="${MEADOW_WP_HEARTBEAT_FILE:-/tmp/meadow_wp_heartbeat}"
 
 # Hung UI detection (Chromium wedged / JS stalled)
