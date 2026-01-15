@@ -2,7 +2,12 @@
 # /home/meadow/meadow-kiosk/remote_control.py
 #
 # Poll WP for control commands (exit/enter/reload/set_url/reboot/shutdown/update_code)
-# and execute them locally. IMPORTANT: never spawn multiple kiosk-launchers.
+# and execute them locally.
+#
+# HARDENING INCLUDED:
+# - Never spawn multiple kiosk-launchers (pgrep guard + cooldown).
+# - Dedupe commands by id (prevents command storms if ack fails / service restarts).
+# - Always attempts to ack (even if command already handled).
 
 import json
 import os
@@ -28,13 +33,18 @@ UPDATE_SCRIPT = "/home/meadow/update-meadow.sh"
 
 LOG_PATH = "/home/meadow/state/remote-control.log"
 
+# Command dedupe
+LAST_CMD_FILE = "/home/meadow/state/remote_control_last_cmd_id"
+
+# Launcher cooldown (avoid rapid relaunch storms if launcher exits instantly)
+LAUNCHER_COOLDOWN_FILE = "/tmp/meadow_launcher_last_start"
+LAUNCHER_COOLDOWN_SECS = int(os.environ.get("MEADOW_LAUNCHER_COOLDOWN_SECS", "10"))
+
 POLL_INTERVAL = float(os.environ.get("MEADOW_CONTROL_POLL_INTERVAL", "2.5"))
 HTTP_TIMEOUT = float(os.environ.get("MEADOW_CONTROL_HTTP_TIMEOUT", "8"))
 
-# Use the *same* auth scheme you already use for config/heartbeat
 # provision.json should contain:
-# { "domain": "https://meadowvending.com", "api_key": "...", "kiosk_token": "..." }
-# and kiosk.config.cache.json contains kiosk_id.
+# { "domain": "https://meadowvending.com", "api_key": "..." }
 CONTROL_SCOPE = "control"
 
 
@@ -59,13 +69,11 @@ def load_json(path: str) -> Optional[Dict[str, Any]]:
 
 
 def load_provision() -> Dict[str, Any]:
-    prov = load_json(PROVISION_PATH) or {}
-    return prov
+    return load_json(PROVISION_PATH) or {}
 
 
 def load_cached_config() -> Dict[str, Any]:
-    cfg = load_json(CACHE_PATH) or {}
-    return cfg
+    return load_json(CACHE_PATH) or {}
 
 
 def wp_api_base(prov: Dict[str, Any]) -> str:
@@ -74,7 +82,11 @@ def wp_api_base(prov: Dict[str, Any]) -> str:
 
 
 def build_env_for_gui() -> Dict[str, str]:
-    """Ensure spawned processes can talk to the GUI session."""
+    """
+    Ensure spawned processes can talk to the GUI session.
+    For labwc/Wayland this isn't always needed, but keeping DISPLAY/XAUTHORITY
+    doesn't hurt for Xwayland setups.
+    """
     env = dict(os.environ)
     env.setdefault("DISPLAY", ":0")
     env.setdefault("XAUTHORITY", "/home/meadow/.Xauthority")
@@ -82,11 +94,50 @@ def build_env_for_gui() -> Dict[str, str]:
 
 
 # -------------------------------------------------------------------
+# Dedupe helpers
+# -------------------------------------------------------------------
+
+def read_last_cmd_id() -> int:
+    try:
+        with open(LAST_CMD_FILE, "r", encoding="utf-8") as f:
+            return int((f.read() or "0").strip() or 0)
+    except Exception:
+        return 0
+
+
+def write_last_cmd_id(cmd_id: int) -> None:
+    try:
+        os.makedirs(os.path.dirname(LAST_CMD_FILE), exist_ok=True)
+        with open(LAST_CMD_FILE, "w", encoding="utf-8") as f:
+            f.write(str(int(cmd_id)))
+    except Exception:
+        pass
+
+
+def launcher_recently_started() -> bool:
+    try:
+        if not os.path.exists(LAUNCHER_COOLDOWN_FILE):
+            return False
+        age = time.time() - os.path.getmtime(LAUNCHER_COOLDOWN_FILE)
+        return age < LAUNCHER_COOLDOWN_SECS
+    except Exception:
+        return False
+
+
+def mark_launcher_started() -> None:
+    try:
+        with open(LAUNCHER_COOLDOWN_FILE, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+# -------------------------------------------------------------------
 # Process helpers
 # -------------------------------------------------------------------
 
 def pkill_chromium() -> None:
-    # be slightly broad but safe (only kiosk chromium)
+    # broad but targeted at kiosk chromium invocations
     subprocess.call(["pkill", "-f", "chromium.*--kiosk"])
     subprocess.call(["pkill", "-f", "chromium-browser.*--kiosk"])
     subprocess.call(["pkill", "-f", "chromium --kiosk"])
@@ -102,7 +153,7 @@ def is_chromium_running() -> bool:
 
 
 def kill_launcher_processes() -> None:
-    # Clean up any duplicated launchers from a previous bug state
+    # clean up any duplicated launchers from a previous bug state
     subprocess.call(["pkill", "-f", LAUNCHER])
 
 
@@ -117,18 +168,22 @@ def is_launcher_running() -> bool:
 def start_launcher_once(env: Dict[str, str]) -> None:
     """
     Start the launcher if not already running.
-    This is CRITICAL to avoid popup storms.
+    Includes cooldown to prevent rapid relaunch storms.
     """
     if is_launcher_running():
         log("[control] launcher already running; not starting another")
         return
 
-    # small safety: if stale dupes existed, kill then start
+    if launcher_recently_started():
+        log("[control] launcher cooldown active; not starting again yet")
+        return
+
+    # kill any stale dupes then start
     kill_launcher_processes()
     time.sleep(0.2)
 
-    # Start launcher detached
     subprocess.Popen(["python3", LAUNCHER], env=env)
+    mark_launcher_started()
     log("[control] launcher started")
 
 
@@ -166,14 +221,13 @@ def exit_to_desktop(env: Dict[str, str]) -> None:
     pkill_chromium()
     log("[control] kiosk stopped; chromium killed")
 
-    # show launcher but do NOT spam it
     start_launcher_once(env)
 
 
 def reload_browser(env: Dict[str, str]) -> None:
     """
     Reload kiosk chromium.
-    If chromium isn't running, start kiosk (this matches “reload” expectation).
+    If chromium isn't running, start kiosk.
     """
     if is_chromium_running():
         pkill_chromium()
@@ -191,7 +245,6 @@ def set_url_and_reload(env: Dict[str, str], url: str) -> None:
         log("[control] set_url: empty url; ignored")
         return
 
-    # Write URL file (what kiosk-browser.sh reads)
     try:
         with open(KIOSK_URL_FILE, "w", encoding="utf-8") as f:
             f.write(url + "\n")
@@ -200,7 +253,6 @@ def set_url_and_reload(env: Dict[str, str], url: str) -> None:
         log(f"[control] failed writing kiosk.url: {e}")
         return
 
-    # Reload kiosk to pick it up
     reload_browser(env)
 
 
@@ -231,10 +283,10 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
     r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     data = r.json()
+
     if not isinstance(data, dict):
         return None
 
-    # Empty response is fine
     if not data.get("id") or not data.get("action"):
         return None
 
@@ -268,42 +320,33 @@ def handle_command(env: Dict[str, str], cmd: Dict[str, Any]) -> None:
 
     log(f"[control] received command id={cmd_id} action={action} payload={payload}")
 
-    try:
-        if action == "enter_kiosk":
-            start_kiosk(env)
+    if action == "enter_kiosk":
+        start_kiosk(env)
 
-        elif action == "exit_kiosk":
-            exit_to_desktop(env)
+    elif action == "exit_kiosk":
+        exit_to_desktop(env)
 
-        elif action == "reload":
-            reload_browser(env)
+    elif action == "reload":
+        reload_browser(env)
 
-        elif action == "set_url":
-            set_url_and_reload(env, str(payload.get("url") or ""))
+    elif action == "set_url":
+        set_url_and_reload(env, str(payload.get("url") or ""))
 
-        elif action == "update_code":
-            branch = payload.get("branch") or "main"
-            log(f"[control] update_code starting (branch={branch})")
-            subprocess.Popen(["bash", UPDATE_SCRIPT, str(branch)], env=env)
+    elif action == "update_code":
+        branch = str(payload.get("branch") or "main")
+        log(f"[control] update_code starting (branch={branch})")
+        subprocess.Popen(["bash", UPDATE_SCRIPT, branch], env=env)
 
-        elif action == "reboot":
-            log("[control] reboot requested")
-            subprocess.call(["sudo", "reboot"])
+    elif action == "reboot":
+        log("[control] reboot requested")
+        subprocess.call(["sudo", "reboot"])
 
-        elif action == "shutdown":
-            log("[control] shutdown requested")
-            subprocess.call(["sudo", "shutdown", "-h", "now"])
+    elif action == "shutdown":
+        log("[control] shutdown requested")
+        subprocess.call(["sudo", "shutdown", "-h", "now"])
 
-        else:
-            log(f"[control] unknown action: {action}")
-
-    finally:
-        # Always ack to prevent repeats.
-        # Even if action fails, we don't want a command storm.
-        # If you want "retry on failure" later, we can add a status field + retries.
-        if cmd_id:
-            # ack handled outside; this just marks we should ack
-            pass
+    else:
+        log(f"[control] unknown action: {action}")
 
 
 def main() -> None:
@@ -315,7 +358,6 @@ def main() -> None:
         while True:
             time.sleep(10)
 
-    # We rely on cached config to know kiosk_id
     log(f"[control] loaded provision: {prov}")
 
     while True:
@@ -327,12 +369,21 @@ def main() -> None:
                 continue
 
             cmd_id = int(cmd.get("id") or 0)
+            last_id = read_last_cmd_id()
+
+            # If already handled, do NOT execute again—just try ack.
+            if cmd_id and cmd_id <= last_id:
+                log(f"[control] cmd id={cmd_id} already handled (last={last_id}); trying ack only")
+                wp_ack_command(prov, cmd_id)
+                time.sleep(POLL_INTERVAL)
+                continue
 
             # Execute
             handle_command(env, cmd)
 
-            # Ack
+            # Mark handled + ack
             if cmd_id:
+                write_last_cmd_id(cmd_id)
                 wp_ack_command(prov, cmd_id)
 
         except Exception as e:
