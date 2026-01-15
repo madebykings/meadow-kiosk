@@ -2,6 +2,9 @@
 Description=Meadow Launcher (desktop menu)
 After=graphical.target
 
+# If launcher starts, kiosk browser must stop
+Conflicts=meadow-kiosk-browser.service
+
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
