@@ -33,6 +33,11 @@ from payment.sigma.sigma_ipp_client import SigmaIppClient
 HOST = "127.0.0.1"
 PORT = 8765
 
+# Updated by the kiosk UI (Chromium) to prove the page/JS is alive
+UI_HEARTBEAT_FILE = os.environ.get("MEADOW_UI_HEARTBEAT_FILE", "/tmp/meadow_ui_heartbeat")
+WP_HEARTBEAT_FILE = os.environ.get("MEADOW_WP_HEARTBEAT_FILE", "/tmp/meadow_wp_heartbeat")
+
+
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -74,45 +79,46 @@ class RuntimeState:
         self._last_config_error: str = ""
         self._last_config_ts: int = 0
 
+        # Heartbeat cache (WP and UI)
+        self._last_heartbeat_ok: bool = False
+        self._last_heartbeat_error: str = ""
+        self._last_heartbeat_ts: int = 0
+        self._cached_imei: str = ""
+
         self._derived_motor_map: Dict[int, int] = {}
         self._derived_spin_map: Dict[int, float] = {}
 
-    # Heartbeat cache
-    self._last_heartbeat_ok: bool = False
-    self._last_heartbeat_error: str = ""
-    self._last_heartbeat_ts: int = 0
-    self._cached_imei: str = ""
+    def get_cfg_copy(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._cfg)
 
-def get_cfg_copy(self) -> Dict[str, Any]:
-    with self._lock:
-        return dict(self._cfg)
-
-def mark_heartbeat_result(self, ok: bool, err: str = "") -> None:
-    with self._lock:
-        self._last_heartbeat_ok = bool(ok)
-        self._last_heartbeat_error = (err or "")[:300]
-        self._last_heartbeat_ts = int(time.time())
-
-def get_heartbeat_status(self) -> Dict[str, Any]:
-    with self._lock:
-        return {
-            "ok": self._last_heartbeat_ok,
-            "error": self._last_heartbeat_error,
-            "ts": self._last_heartbeat_ts,
-        }
-
-def get_cached_imei(self) -> str:
-    with self._lock:
-        return self._cached_imei
-
-def set_cached_imei(self, imei: str) -> None:
-    with self._lock:
-        self._cached_imei = (imei or "")[:40]
     def mark_poll_result(self, ok: bool, err: str = "") -> None:
         with self._lock:
             self._last_config_ok = bool(ok)
             self._last_config_error = (err or "")[:2000]
             self._last_config_ts = int(time.time())
+
+    def mark_heartbeat_result(self, ok: bool, err: str = "") -> None:
+        with self._lock:
+            self._last_heartbeat_ok = bool(ok)
+            self._last_heartbeat_error = (err or "")[:300]
+            self._last_heartbeat_ts = int(time.time())
+
+    def get_heartbeat_status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "ok": self._last_heartbeat_ok,
+                "error": self._last_heartbeat_error,
+                "ts": self._last_heartbeat_ts,
+            }
+
+    def get_cached_imei(self) -> str:
+        with self._lock:
+            return self._cached_imei
+
+    def set_cached_imei(self, imei: str) -> None:
+        with self._lock:
+            self._cached_imei = (imei or "")[:40]
 
     def update_from_wp(self, cfg: Dict[str, Any]) -> None:
         with self._lock:
@@ -163,7 +169,11 @@ def set_cached_imei(self, imei: str) -> None:
                     "motors": self._derived_motor_map,
                     "spin_time": self._derived_spin_map,
                 },
-                "heartbeat": self.get_heartbeat_status(),
+                "heartbeat": {
+                    "ok": self._last_heartbeat_ok,
+                    "error": self._last_heartbeat_error,
+                    "ts": self._last_heartbeat_ts,
+                },
                 "cached_imei": self._cached_imei,
                 "sigma_path": self._sigma_path,
                 "sigma_baud": self._sigma_baud,
@@ -177,8 +187,6 @@ def set_cached_imei(self, imei: str) -> None:
     def get_motors(self) -> Optional[MotorController]:
         with self._lock:
             return self._motors
-
-
 
 def _git_short_hash() -> str:
     """Return short git hash for current checkout, or empty string."""
@@ -221,6 +229,12 @@ def _post_heartbeat(cfg: Dict[str, Any]) -> None:
             STATE.mark_heartbeat_result(False, f"HTTP {r.status_code}")
         else:
             STATE.mark_heartbeat_result(True, "")
+            # Touch WP heartbeat file so the kiosk browser can detect connectivity
+            try:
+                with open(WP_HEARTBEAT_FILE, "a"):
+                    os.utime(WP_HEARTBEAT_FILE, None)
+            except Exception:
+                pass
     except Exception as e:
         STATE.mark_heartbeat_result(False, str(e)[:200])
 
@@ -285,9 +299,26 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/debug/config"):
             return _json_response(self, 200, STATE.snapshot())
 
+        if self.path.startswith("/heartbeat"):
+            # Touch UI heartbeat file
+            try:
+                with open(UI_HEARTBEAT_FILE, "a"):
+                    os.utime(UI_HEARTBEAT_FILE, None)
+            except Exception:
+                pass
+            return _json_response(self, 200, {"ok": True})
+
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
+        if self.path.startswith("/heartbeat"):
+            try:
+                with open(UI_HEARTBEAT_FILE, "a"):
+                    os.utime(UI_HEARTBEAT_FILE, None)
+            except Exception:
+                pass
+            return _json_response(self, 200, {"ok": True})
+
         if self.path.startswith("/sigma/purchase"):
             return self._handle_sigma_purchase()
 
