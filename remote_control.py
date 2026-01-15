@@ -292,21 +292,18 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
     params = {
     "kiosk_id": kiosk_id,
     "scope": CONTROL_SCOPE,
-    "key": kiosk_token,           # kiosk key
-    "api_key": api_key,           # master API key (some WP expects this in query)
+    "key": api_key,               # ✅ WP "key" == API KEY
+    "kiosk_token": kiosk_token,   # optional extra (future hardening)
     "_t": int(time.time()),
     }
 
-
     headers = {
-        "Cache-Control": "no-store",
+    "Cache-Control": "no-store",
     }
-
-    # Back-compat: if WP checks header instead of query param
     if api_key:
         headers["X-API-KEY"] = api_key
-    # Extra back-compat: some versions might look for token in header
-    headers["X-KIOSK-TOKEN"] = kiosk_token
+    if kiosk_token:
+        headers["X-KIOSK-TOKEN"] = kiosk_token
 
     url = api + "/next-command"
 
