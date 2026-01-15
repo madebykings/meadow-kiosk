@@ -1,6 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+LOG_FILE="/home/meadow/state/kiosk-browser.log"
+
+log() {
+  local msg="$1"
+  local ts
+  ts="$(date -Is 2>/dev/null || date)"
+  echo "${ts} ${msg}" >> "$LOG_FILE" 2>/dev/null || true
+  echo "${msg}" >&2
+}
+
 URL_FILE="/home/meadow/kiosk.url"
 DEFAULT_URL="about:blank"
 OFFLINE_URL="file:///home/meadow/offline.html"
@@ -12,7 +22,6 @@ UI_HEARTBEAT_FILE="/tmp/meadow_ui_heartbeat"
 WP_HEARTBEAT_FILE="/tmp/meadow_wp_heartbeat"
 log "[Meadow] Using UI_HEARTBEAT_FILE=$UI_HEARTBEAT_FILE"
 log "[Meadow] Using WP_HEARTBEAT_FILE=$WP_HEARTBEAT_FILE"
-
 
 # Hung UI detection (Chromium wedged / JS stalled)
 UI_HEARTBEAT_MAX_AGE="${MEADOW_UI_HEARTBEAT_MAX_AGE:-45}"
@@ -32,18 +41,9 @@ BACKOFF_START="${MEADOW_BACKOFF_START:-2}"
 BACKOFF_MAX="${MEADOW_BACKOFF_MAX:-60}"
 
 RESTART_LOG="/tmp/meadow_kiosk_restart_times"
-LOG_FILE="/home/meadow/state/kiosk-browser.log"
 
 # Local daemon heartbeat endpoint (must return 200)
 DAEMON_HEARTBEAT_URL="${MEADOW_DAEMON_HEARTBEAT_URL:-http://127.0.0.1:8765/heartbeat}"
-
-log() {
-  local msg="$1"
-  local ts
-  ts="$(date -Is 2>/dev/null || date)"
-  echo "${ts} ${msg}" >> "$LOG_FILE" 2>/dev/null || true
-  echo "${msg}" >&2
-}
 
 get_url() {
   if [ -f "$URL_FILE" ]; then
@@ -85,7 +85,6 @@ heartbeat_age() {
 
 # Bridge: if daemon responds, mark UI heartbeat as fresh
 bridge_ui_heartbeat() {
-  # Keep this extremely lightweight: 1 localhost request every WATCH_INTERVAL seconds
   if curl -sS -m 1 -o /dev/null -X POST "$DAEMON_HEARTBEAT_URL"; then
     touch "$UI_HEARTBEAT_FILE" 2>/dev/null || true
   fi
@@ -155,10 +154,8 @@ while true; do
     NOW=$(date +%s)
     ELAPSED=$((NOW - START_TS))
 
-    # Keep UI heartbeat fresh if daemon is up
     bridge_ui_heartbeat
 
-    # Restart Chromium if UI heartbeat stale after grace
     UI_AGE="$(heartbeat_age "$UI_HEARTBEAT_FILE")"
     if [ "$ELAPSED" -gt "$HEARTBEAT_GRACE" ] && [ "$UI_AGE" -gt "$UI_HEARTBEAT_MAX_AGE" ]; then
       log "[Meadow] UI heartbeat stale (${UI_AGE}s) — restarting Chromium"
@@ -166,7 +163,6 @@ while true; do
       break
     fi
 
-    # Restart into offline if WP heartbeat stale after grace
     WP_AGE="$(heartbeat_age "$WP_HEARTBEAT_FILE")"
     if [ "$ELAPSED" -gt "$HEARTBEAT_GRACE" ] && [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ] && [ "$URL" != "$OFFLINE_URL" ]; then
       log "[Meadow] WP heartbeat stale (${WP_AGE}s) — switching to offline screen"
@@ -179,14 +175,20 @@ while true; do
 
   wait "$CHROME_PID" 2>/dev/null || true
 
-  # Restart protection & backoff
   touch_restart
   CNT="$(restart_count)"
 
   if [ "$CNT" -gt "$MAX_RESTARTS_IN_WINDOW" ]; then
     log "[Meadow] Too many restarts (${CNT} in ${RESTART_WINDOW_SECS}s) — stopping kiosk and showing launcher"
     echo "$(date -Is 2>/dev/null || date)" > "$STOP_FLAG" 2>/dev/null || true
-    python3 /home/meadow/kiosk-launcher.py >/dev/null 2>&1 || true
+
+    # Guarded, detached launcher start
+    if ! pgrep -f "/home/meadow/kiosk-launcher.py" >/dev/null 2>&1; then
+      nohup python3 /home/meadow/kiosk-launcher.py >/dev/null 2>&1 &
+    else
+      log "[Meadow] launcher already running; not starting another"
+    fi
+
     exit 0
   fi
 
