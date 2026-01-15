@@ -2,9 +2,6 @@
 Description=Meadow Launcher (desktop menu)
 After=graphical.target
 
-# If launcher starts, kiosk browser must stop
-Conflicts=meadow-kiosk-browser.service
-
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
@@ -13,6 +10,7 @@ Type=simple
 User=meadow
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/meadow/.Xauthority
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 
 ExecStart=/usr/bin/python3 /home/meadow/kiosk-launcher.py
 Restart=on-failure
