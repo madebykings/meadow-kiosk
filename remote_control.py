@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # /home/meadow/meadow-kiosk/remote_control.py
 #
-# Poll WP for control commands (enter/exit/reload/set_url/reboot/shutdown/update_code)
-# and execute them locally.
+# Poll WP for control commands and execute them locally.
+#
+# IMPORTANT AUTH RULE:
+# - Use cfg.api_key (cached config) for /next-command and /command-complete.
+# - DO NOT use prov.api_key here (prov is provisioning/bootstrap only).
 #
 # HARDENING:
 # - Dedupe commands by id
-# - Uses systemd as source of truth (no duplicate processes)
-# - Always tries to ack (even if already handled)
-# - Auth sent as query param key=... (matches WP plugin expectations)
-# - Backoff on repeated failures (prevents "death by 1000 polls")
+# - Uses systemd as source of truth
+# - Backoff on failures (prevents "death by 1000 polls")
 
 import json
 import os
@@ -18,10 +19,6 @@ import subprocess
 from typing import Any, Dict, Optional
 
 import requests
-
-# -------------------------------------------------------------------
-# Paths / config
-# -------------------------------------------------------------------
 
 PROVISION_PATH = "/boot/provision.json"
 CACHE_PATH = "/home/meadow/kiosk.config.cache.json"
@@ -32,15 +29,12 @@ STOP_FLAG = "/tmp/meadow_kiosk_stop"
 UPDATE_SCRIPT = "/home/meadow/update-meadow.sh"
 LOG_PATH = "/home/meadow/state/remote-control.log"
 
-# Command dedupe
 LAST_CMD_FILE = "/home/meadow/state/remote_control_last_cmd_id"
 
 POLL_INTERVAL = float(os.environ.get("MEADOW_CONTROL_POLL_INTERVAL", "2.5"))
 HTTP_TIMEOUT = float(os.environ.get("MEADOW_CONTROL_HTTP_TIMEOUT", "8"))
-
 CONTROL_SCOPE = "control"
 
-# systemd units
 KIOSK_BROWSER_UNIT = "meadow-kiosk-browser.service"
 LAUNCHER_UNIT = "meadow-launcher.service"
 
@@ -82,14 +76,10 @@ def load_cached_config() -> Dict[str, Any]:
     return load_json(CACHE_PATH) or {}
 
 
-def wp_api_base(prov: Dict[str, Any]) -> str:
-    domain = (prov.get("domain") or "").rstrip("/")
+def wp_api_base(prov: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    domain = (cfg.get("domain") or prov.get("domain") or "").rstrip("/")
     return domain + "/wp-json/meadow/v1"
 
-
-# -------------------------------------------------------------------
-# Dedupe helpers
-# -------------------------------------------------------------------
 
 def read_last_cmd_id() -> int:
     try:
@@ -108,16 +98,8 @@ def write_last_cmd_id(cmd_id: int) -> None:
         pass
 
 
-# -------------------------------------------------------------------
-# systemd helpers (source of truth)
-# -------------------------------------------------------------------
-
 def systemctl(*args: str) -> int:
-    """
-    Run systemctl via sudo (requires sudoers drop-in added by install.sh).
-    """
-    cmd = ["sudo", "systemctl", *args]
-    return subprocess.call(cmd)
+    return subprocess.call(["sudo", "systemctl", *args])
 
 
 def enter_kiosk() -> None:
@@ -126,7 +108,6 @@ def enter_kiosk() -> None:
             os.remove(STOP_FLAG)
     except Exception:
         pass
-
     systemctl("stop", LAUNCHER_UNIT)
     systemctl("start", KIOSK_BROWSER_UNIT)
     log("[control] enter_kiosk -> start meadow-kiosk-browser, stop meadow-launcher")
@@ -138,7 +119,6 @@ def exit_kiosk() -> None:
             f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
     except Exception:
         pass
-
     systemctl("stop", KIOSK_BROWSER_UNIT)
     systemctl("start", LAUNCHER_UNIT)
     log("[control] exit_kiosk -> stop meadow-kiosk-browser, start meadow-launcher")
@@ -154,7 +134,6 @@ def set_url_and_reload(url: str) -> None:
     if not url:
         log("[control] set_url: empty url; ignored")
         return
-
     try:
         with open(KIOSK_URL_FILE, "w", encoding="utf-8") as f:
             f.write(url + "\n")
@@ -162,25 +141,22 @@ def set_url_and_reload(url: str) -> None:
     except Exception as e:
         log(f"[control] failed writing kiosk.url: {e}")
         return
-
     reload_kiosk()
 
 
-# -------------------------------------------------------------------
-# WP polling + acknowledgements
-# -------------------------------------------------------------------
+def kiosk_key(cfg: Dict[str, Any]) -> str:
+    # ✅ SOURCE OF TRUTH for operations
+    return (cfg.get("api_key") or cfg.get("key") or "").strip()
 
-def _get_wp_key(prov: Dict[str, Any], cfg: Dict[str, Any]) -> str:
-    """
-    Prefer provision api_key (master), fall back to cached config keys.
-    """
-    return (prov.get("api_key") or cfg.get("api_key") or cfg.get("key") or "").strip()
+
+def kiosk_token(cfg: Dict[str, Any], prov: Dict[str, Any]) -> str:
+    return (cfg.get("kiosk_token") or cfg.get("token") or prov.get("token") or "").strip()
 
 
 def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    api = wp_api_base(prov)
+    api = wp_api_base(prov, cfg)
     kiosk_id = int(cfg.get("kiosk_id") or 0)
-    key = _get_wp_key(prov, cfg)
+    key = kiosk_key(cfg)
 
     if not api or not kiosk_id or not key:
         log(f"[control] missing auth for next-command (kiosk_id={kiosk_id}, key={_mask(key)})")
@@ -188,24 +164,21 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
 
     params = {
         "kiosk_id": kiosk_id,
-        "key": key,                 # ✅ WP expects key in params
+        "key": key,  # ✅ WP expects query param
         "scope": CONTROL_SCOPE,
         "_t": int(time.time()),
     }
 
-    # Optional token, if your endpoint expects it (harmless if ignored)
-    token = (cfg.get("token") or prov.get("token") or "").strip()
-    if token:
-        params["token"] = token
+    # optional token (safe if WP ignores it)
+    tok = kiosk_token(cfg, prov)
+    if tok:
+        params["token"] = tok
 
-    headers = {
-        "X-API-KEY": key,           # keep for future / debugging
-        "Cache-Control": "no-store",
-    }
+    headers = {"Cache-Control": "no-store"}
 
     url = api + "/next-command"
-
     r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+
     if r.status_code >= 400:
         body = (r.text or "")[:400]
         log(f"[control] next-command HTTP error: {r.status_code} {r.reason} body={body}")
@@ -220,17 +193,15 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
 
 
 def wp_ack_command(prov: Dict[str, Any], cfg: Dict[str, Any], cmd_id: int) -> None:
-    api = wp_api_base(prov)
-    key = _get_wp_key(prov, cfg)
+    api = wp_api_base(prov, cfg)
+    key = kiosk_key(cfg)
+
     if not api or not cmd_id or not key:
         return
 
     url = api + "/command-complete"
-
-    # ✅ Send key in JSON too (some WP handlers validate it there)
     payload = {"id": int(cmd_id), "key": key, "ts": int(time.time())}
-
-    headers = {"X-API-KEY": key, "Cache-Control": "no-store"}
+    headers = {"Cache-Control": "no-store"}
 
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT)
@@ -241,10 +212,6 @@ def wp_ack_command(prov: Dict[str, Any], cfg: Dict[str, Any], cmd_id: int) -> No
     except Exception as e:
         log(f"[control] ack failed for id={cmd_id}: {e}")
 
-
-# -------------------------------------------------------------------
-# Main loop
-# -------------------------------------------------------------------
 
 def handle_command(cmd: Dict[str, Any]) -> None:
     cmd_id = int(cmd.get("id") or 0)
@@ -257,29 +224,22 @@ def handle_command(cmd: Dict[str, Any]) -> None:
 
     if action == "enter_kiosk":
         enter_kiosk()
-
     elif action == "exit_kiosk":
         exit_kiosk()
-
     elif action == "reload":
         reload_kiosk()
-
     elif action == "set_url":
         set_url_and_reload(str(payload.get("url") or ""))
-
     elif action == "update_code":
         branch = str(payload.get("branch") or "main")
         log(f"[control] update_code starting (branch={branch})")
         subprocess.Popen(["bash", UPDATE_SCRIPT, branch])
-
     elif action == "reboot":
         log("[control] reboot requested")
         subprocess.call(["sudo", "reboot"])
-
     elif action == "shutdown":
         log("[control] shutdown requested")
         subprocess.call(["sudo", "shutdown", "-h", "now"])
-
     else:
         log(f"[control] unknown action: {action}")
 
@@ -291,20 +251,22 @@ def main() -> None:
         while True:
             time.sleep(10)
 
-    # Don't print secrets in logs
-    log(f"[control] provision loaded (domain={prov.get('domain')}, api_key={_mask(str(prov.get('api_key') or ''))})")
+    cfg0 = load_cached_config()
+    log(
+        "[control] starting "
+        f"(kiosk_id={cfg0.get('kiosk_id')}, domain={(cfg0.get('domain') or prov.get('domain'))}, "
+        f"cfg.api_key={_mask(kiosk_key(cfg0))}, prov.api_key={_mask(str(prov.get('api_key') or ''))})"
+    )
 
-    backoff = 0.0
     failures = 0
 
     while True:
         try:
             cfg = load_cached_config()
-
             cmd = wp_get_next_command(prov, cfg)
+
             if not cmd:
                 failures = 0
-                backoff = 0.0
                 time.sleep(POLL_INTERVAL)
                 continue
 
@@ -324,13 +286,12 @@ def main() -> None:
                 wp_ack_command(prov, cfg, cmd_id)
 
             failures = 0
-            backoff = 0.0
 
         except Exception as e:
             failures += 1
-            backoff = min(30.0, 2.0 * failures)  # 2s,4s,6s... up to 30s
+            backoff = min(30.0, 2.0 * failures)
             log(f"[control] poll/handle error: {e} (failures={failures}, backoff={backoff}s)")
-            time.sleep(backoff if backoff else 3.0)
+            time.sleep(backoff)
 
 
 if __name__ == "__main__":
