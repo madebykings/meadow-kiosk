@@ -296,10 +296,20 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
     }
 
     url = api + "/next-command"
-    r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
 
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        body = ""
+        try:
+            body = (r.text or "")[:1200]  # log enough to see WP error code/message
+        except Exception:
+            pass
+        log(f"[control] next-command HTTP error: {e} body={body}")
+        raise
+
+    data = r.json()
     if not isinstance(data, dict):
         return None
 
@@ -307,7 +317,6 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
         return None
 
     return data
-
 
 def wp_ack_command(prov: Dict[str, Any], cmd_id: int) -> None:
     api = wp_api_base(prov)
