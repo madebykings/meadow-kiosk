@@ -71,6 +71,11 @@ sudo cp -f "$SCRIPT_DIR/labwc/autostart" /home/meadow/.config/labwc/autostart
 sudo chmod +x /home/meadow/.config/labwc/autostart
 sudo chown meadow:meadow /home/meadow/.config/labwc/autostart
 
+echo "=== Configure Labwc keybindings ==="
+sudo -u meadow mkdir -p /home/meadow/.config/labwc
+sudo cp -f "$SCRIPT_DIR/labwc/rc.xml" /home/meadow/.config/labwc/rc.xml
+sudo chown meadow:meadow /home/meadow/.config/labwc/rc.xml
+
 echo "=== Desktop icons (Enter/Exit kiosk) ==="
 sudo mkdir -p /home/meadow/Desktop
 sudo cp desktop/enter-kiosk.desktop /home/meadow/Desktop/Enter\ Meadow\ Kiosk.desktop
