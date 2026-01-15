@@ -113,8 +113,7 @@ def write_url(new_url: str) -> None:
     tmp_path = URL_FILE + ".tmp"
     os.makedirs(os.path.dirname(URL_FILE), exist_ok=True)
     with open(tmp_path, "w") as f:
-        f.write(new_url + "
-")
+        f.write(new_url + "\n")
     os.replace(tmp_path, URL_FILE)
 
 def clear_stop_flag() -> None:
