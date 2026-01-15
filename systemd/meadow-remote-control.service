@@ -11,8 +11,10 @@ Environment=PYTHONUNBUFFERED=1
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/meadow/.Xauthority
 ExecStart=/usr/bin/python3 /home/meadow/meadow-kiosk/remote_control.py
-Restart=always
-RestartSec=3
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 StandardOutput=journal
 StandardError=journal
