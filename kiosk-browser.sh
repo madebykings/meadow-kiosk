@@ -78,7 +78,7 @@ heartbeat_age() {
   fi
 }
 
-# Small delay to let X start
+# Small delay to let X/Wayland session start
 sleep 2
 
 BACKOFF="$BACKOFF_START"
@@ -89,20 +89,33 @@ while true; do
   fi
 
   NOW=$(date +%s)
+
   # Decide which URL to show: if WP offline, show offline page.
   URL="$(get_url)"
   if [ -z "$URL" ]; then URL="$DEFAULT_URL"; fi
 
-  # If WP heartbeat is stale beyond grace, switch to offline URL.
+  # If WP heartbeat is stale, switch to offline URL.
   WP_AGE="$(heartbeat_age "$WP_HEARTBEAT_FILE")"
   if [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ]; then
-    # We still allow a grace window after boot before forcing offline screen
-    # by checking for the presence of the WP heartbeat at least once.
     URL="$OFFLINE_URL"
   fi
 
+  # Detect chromium binary (varies by distro)
+  CHROME_BIN="${MEADOW_CHROME_BIN:-}"
+  if [ -z "$CHROME_BIN" ]; then
+    CHROME_BIN="$(command -v chromium-browser 2>/dev/null || true)"
+    if [ -z "$CHROME_BIN" ]; then
+      CHROME_BIN="$(command -v chromium 2>/dev/null || true)"
+    fi
+  fi
+
+  if [ -z "$CHROME_BIN" ]; then
+    log "[Meadow] ERROR: Chromium not found. Install 'chromium' package."
+    exit 1
+  fi
+
   # Chromium kiosk flags
-  chromium-browser \
+  "$CHROME_BIN" \
     --kiosk \
     --noerrdialogs \
     --disable-infobars \
