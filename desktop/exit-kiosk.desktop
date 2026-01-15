@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Exit Meadow Kiosk
+Comment=Exit Meadow kiosk mode and return to desktop
+Exec=/home/meadow/exit-kiosk.sh
+Icon=system-shutdown
+Terminal=false
+Categories=Utility;
