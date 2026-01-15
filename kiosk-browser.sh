@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 URL_FILE="/home/meadow/kiosk.url"
 DEFAULT_URL="about:blank"
@@ -31,6 +31,9 @@ BACKOFF_MAX="${MEADOW_BACKOFF_MAX:-60}"
 RESTART_LOG="/tmp/meadow_kiosk_restart_times"
 LOG_FILE="/home/meadow/state/kiosk-browser.log"
 
+# Local daemon heartbeat endpoint (must return 200)
+DAEMON_HEARTBEAT_URL="${MEADOW_DAEMON_HEARTBEAT_URL:-http://127.0.0.1:8765/heartbeat}"
+
 log() {
   local msg="$1"
   local ts
@@ -51,7 +54,6 @@ touch_restart() {
   local now
   now=$(date +%s)
   echo "$now" >> "$RESTART_LOG" 2>/dev/null || true
-  # prune old entries
   if [ -f "$RESTART_LOG" ]; then
     awk -v now="$now" -v win="$RESTART_WINDOW_SECS" 'now-$1 <= win {print $1}' "$RESTART_LOG" > "${RESTART_LOG}.tmp" 2>/dev/null || true
     mv -f "${RESTART_LOG}.tmp" "$RESTART_LOG" 2>/dev/null || true
@@ -78,6 +80,14 @@ heartbeat_age() {
   fi
 }
 
+# Bridge: if daemon responds, mark UI heartbeat as fresh
+bridge_ui_heartbeat() {
+  # Keep this extremely lightweight: 1 localhost request every WATCH_INTERVAL seconds
+  if curl -sS -m 1 -o /dev/null -X POST "$DAEMON_HEARTBEAT_URL"; then
+    touch "$UI_HEARTBEAT_FILE" 2>/dev/null || true
+  fi
+}
+
 # Small delay to let X/Wayland session start
 sleep 2
 
@@ -88,19 +98,16 @@ while true; do
     exit 0
   fi
 
-  NOW=$(date +%s)
-
-  # Decide which URL to show: if WP offline, show offline page.
+  # Decide URL
   URL="$(get_url)"
   if [ -z "$URL" ]; then URL="$DEFAULT_URL"; fi
 
-  # If WP heartbeat is stale, switch to offline URL.
   WP_AGE="$(heartbeat_age "$WP_HEARTBEAT_FILE")"
   if [ -f "$WP_HEARTBEAT_FILE" ] && [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ]; then
     URL="$OFFLINE_URL"
   fi
 
-  # Detect chromium binary (varies by distro)
+  # Detect chromium binary
   CHROME_BIN="${MEADOW_CHROME_BIN:-}"
   if [ -z "$CHROME_BIN" ]; then
     CHROME_BIN="$(command -v chromium-browser 2>/dev/null || true)"
@@ -114,6 +121,10 @@ while true; do
     exit 1
   fi
 
+  # Ensure heartbeat file exists (prevents huge ages on first run)
+  touch "$UI_HEARTBEAT_FILE" 2>/dev/null || true
+  touch "$WP_HEARTBEAT_FILE" 2>/dev/null || true
+
   # Chromium kiosk flags
   "$CHROME_BIN" \
     --kiosk \
@@ -125,6 +136,7 @@ while true; do
     --autoplay-policy=no-user-gesture-required \
     --allow-running-insecure-content \
     --unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:8765 \
+    --disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights \
     "$URL" &
   CHROME_PID=$!
   START_TS=$(date +%s)
@@ -140,7 +152,10 @@ while true; do
     NOW=$(date +%s)
     ELAPSED=$((NOW - START_TS))
 
-    # If UI heartbeat is stale after grace, restart Chromium.
+    # Keep UI heartbeat fresh if daemon is up
+    bridge_ui_heartbeat
+
+    # Restart Chromium if UI heartbeat stale after grace
     UI_AGE="$(heartbeat_age "$UI_HEARTBEAT_FILE")"
     if [ "$ELAPSED" -gt "$HEARTBEAT_GRACE" ] && [ "$UI_AGE" -gt "$UI_HEARTBEAT_MAX_AGE" ]; then
       log "[Meadow] UI heartbeat stale (${UI_AGE}s) — restarting Chromium"
@@ -148,7 +163,7 @@ while true; do
       break
     fi
 
-    # If WP heartbeat is stale after grace and we're not already showing offline, restart into offline.
+    # Restart into offline if WP heartbeat stale after grace
     WP_AGE="$(heartbeat_age "$WP_HEARTBEAT_FILE")"
     if [ "$ELAPSED" -gt "$HEARTBEAT_GRACE" ] && [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ] && [ "$URL" != "$OFFLINE_URL" ]; then
       log "[Meadow] WP heartbeat stale (${WP_AGE}s) — switching to offline screen"
@@ -167,7 +182,6 @@ while true; do
 
   if [ "$CNT" -gt "$MAX_RESTARTS_IN_WINDOW" ]; then
     log "[Meadow] Too many restarts (${CNT} in ${RESTART_WINDOW_SECS}s) — stopping kiosk and showing launcher"
-    # Stop loop and bring launcher back
     echo "$(date -Is 2>/dev/null || date)" > "$STOP_FLAG" 2>/dev/null || true
     python3 /home/meadow/kiosk-launcher.py >/dev/null 2>&1 || true
     exit 0
@@ -176,13 +190,11 @@ while true; do
   log "[Meadow] Chromium exited — backoff ${BACKOFF}s (restart count ${CNT}/${MAX_RESTARTS_IN_WINDOW})"
   sleep "$BACKOFF"
 
-  # exponential backoff up to cap
   BACKOFF=$((BACKOFF * 2))
   if [ "$BACKOFF" -gt "$BACKOFF_MAX" ]; then
     BACKOFF="$BACKOFF_MAX"
   fi
 
-  # Reset backoff if the UI heartbeat is healthy (i.e. things are working again)
   UI_AGE="$(heartbeat_age "$UI_HEARTBEAT_FILE")"
   if [ "$UI_AGE" -le "$UI_HEARTBEAT_MAX_AGE" ]; then
     BACKOFF="$BACKOFF_START"
