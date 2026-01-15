@@ -96,7 +96,7 @@ while true; do
 
   # If WP heartbeat is stale, switch to offline URL.
   WP_AGE="$(heartbeat_age "$WP_HEARTBEAT_FILE")"
-  if [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ]; then
+  if [ -f "$WP_HEARTBEAT_FILE" ] && [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ]; then
     URL="$OFFLINE_URL"
   fi
 
