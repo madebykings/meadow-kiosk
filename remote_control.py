@@ -5,9 +5,10 @@
 # and execute them locally.
 #
 # HARDENING INCLUDED:
-# - Never spawn multiple kiosk-launchers (pgrep guard + cooldown).
 # - Dedupe commands by id (prevents command storms if ack fails / service restarts).
 # - Always attempts to ack (even if command already handled).
+# - Kiosk and launcher are controlled via systemd services (single owner).
+# - Launcher start is guarded with a cooldown (prevents spawn storms).
 
 import json
 import os
@@ -27,11 +28,13 @@ CACHE_PATH = "/home/meadow/kiosk.config.cache.json"
 KIOSK_URL_FILE = "/home/meadow/kiosk.url"
 STOP_FLAG = "/tmp/meadow_kiosk_stop"
 
-LAUNCHER = "/home/meadow/kiosk-launcher.py"
-KIOSK_BROWSER = "/home/meadow/kiosk-browser.sh"
 UPDATE_SCRIPT = "/home/meadow/update-meadow.sh"
 
 LOG_PATH = "/home/meadow/state/remote-control.log"
+
+# systemd units (recommended architecture)
+KIOSK_SERVICE = os.environ.get("MEADOW_KIOSK_SERVICE", "meadow-kiosk-browser.service")
+LAUNCHER_SERVICE = os.environ.get("MEADOW_LAUNCHER_SERVICE", "meadow-launcher.service")
 
 # Command dedupe
 LAST_CMD_FILE = "/home/meadow/state/remote_control_last_cmd_id"
@@ -81,18 +84,6 @@ def wp_api_base(prov: Dict[str, Any]) -> str:
     return domain + "/wp-json/meadow/v1"
 
 
-def build_env_for_gui() -> Dict[str, str]:
-    """
-    Ensure spawned processes can talk to the GUI session.
-    For labwc/Wayland this isn't always needed, but keeping DISPLAY/XAUTHORITY
-    doesn't hurt for Xwayland setups.
-    """
-    env = dict(os.environ)
-    env.setdefault("DISPLAY", ":0")
-    env.setdefault("XAUTHORITY", "/home/meadow/.Xauthority")
-    return env
-
-
 # -------------------------------------------------------------------
 # Dedupe helpers
 # -------------------------------------------------------------------
@@ -133,66 +124,81 @@ def mark_launcher_started() -> None:
 
 
 # -------------------------------------------------------------------
-# Process helpers
+# systemd helpers
+# -------------------------------------------------------------------
+
+def systemctl(*args: str) -> int:
+    return subprocess.call(["systemctl", *args])
+
+
+def systemctl_user(*args: str) -> int:
+    """
+    If you later decide to run these as --user units, switch calls to this.
+    For now we assume system units under /etc/systemd/system.
+    """
+    return subprocess.call(["systemctl", "--user", *args])
+
+
+def is_active(unit: str) -> bool:
+    return subprocess.call(["systemctl", "is-active", "--quiet", unit]) == 0
+
+
+def start_unit(unit: str) -> None:
+    systemctl("start", unit)
+
+
+def stop_unit(unit: str) -> None:
+    systemctl("stop", unit)
+
+
+def restart_unit(unit: str) -> None:
+    systemctl("restart", unit)
+
+
+# -------------------------------------------------------------------
+# Process helpers (only for chromium cleanup & safety)
 # -------------------------------------------------------------------
 
 def pkill_chromium() -> None:
-    # broad but targeted at kiosk chromium invocations
     subprocess.call(["pkill", "-f", "chromium.*--kiosk"])
     subprocess.call(["pkill", "-f", "chromium-browser.*--kiosk"])
     subprocess.call(["pkill", "-f", "chromium --kiosk"])
     subprocess.call(["pkill", "-f", "chromium-browser --kiosk"])
 
 
-def is_chromium_running() -> bool:
-    try:
-        out = subprocess.check_output(["pgrep", "-f", "chromium.*--kiosk"], text=True).strip()
-        return bool(out)
-    except Exception:
-        return False
+# -------------------------------------------------------------------
+# Actions
+# -------------------------------------------------------------------
 
-
-def kill_launcher_processes() -> None:
-    # clean up any duplicated launchers from a previous bug state
-    subprocess.call(["pkill", "-f", LAUNCHER])
-
-
-def is_launcher_running() -> bool:
-    try:
-        out = subprocess.check_output(["pgrep", "-f", LAUNCHER], text=True).strip()
-        return bool(out)
-    except Exception:
-        return False
-
-
-def start_launcher_once(env: Dict[str, str]) -> None:
+def start_launcher_once() -> None:
     """
-    Start the launcher if not already running.
-    Includes cooldown to prevent rapid relaunch storms.
+    Start launcher via systemd (guarded) to avoid popup storms.
     """
-    if is_launcher_running():
-        log("[control] launcher already running; not starting another")
+    if is_active(LAUNCHER_SERVICE):
+        log("[control] launcher service already active; not starting another")
         return
 
     if launcher_recently_started():
         log("[control] launcher cooldown active; not starting again yet")
         return
 
-    # kill any stale dupes then start
-    kill_launcher_processes()
-    time.sleep(0.2)
-
-    subprocess.Popen(["python3", LAUNCHER], env=env)
+    # Start launcher service
+    start_unit(LAUNCHER_SERVICE)
     mark_launcher_started()
-    log("[control] launcher started")
+    log("[control] launcher service started")
 
 
-def start_kiosk(env: Dict[str, str]) -> None:
+def stop_launcher() -> None:
+    stop_unit(LAUNCHER_SERVICE)
+    log("[control] launcher service stopped")
+
+
+def start_kiosk() -> None:
     """
     Enter kiosk mode:
     - remove stop flag
-    - kill any launcher
-    - start kiosk loop (kiosk-browser.sh)
+    - stop launcher
+    - start kiosk browser service
     """
     try:
         if os.path.exists(STOP_FLAG):
@@ -200,17 +206,31 @@ def start_kiosk(env: Dict[str, str]) -> None:
     except Exception:
         pass
 
-    kill_launcher_processes()
-    subprocess.Popen([KIOSK_BROWSER], env=env)
-    log("[control] kiosk started")
+    # Ensure launcher is not in the way
+    stop_launcher()
+
+    # Ensure a clean chromium slate (optional but helpful)
+    pkill_chromium()
+
+    start_unit(KIOSK_SERVICE)
+    log("[control] kiosk service started")
 
 
-def exit_to_desktop(env: Dict[str, str]) -> None:
+def stop_kiosk() -> None:
+    """
+    Stop kiosk browser service and kill chromium just in case.
+    """
+    stop_unit(KIOSK_SERVICE)
+    pkill_chromium()
+    log("[control] kiosk service stopped; chromium killed")
+
+
+def exit_to_desktop() -> None:
     """
     Exit kiosk mode:
     - create stop flag so kiosk loop exits
-    - kill chromium kiosk
-    - show launcher (only once)
+    - stop kiosk service
+    - show launcher (guarded)
     """
     try:
         with open(STOP_FLAG, "w", encoding="utf-8") as f:
@@ -218,28 +238,24 @@ def exit_to_desktop(env: Dict[str, str]) -> None:
     except Exception:
         pass
 
-    pkill_chromium()
-    log("[control] kiosk stopped; chromium killed")
-
-    start_launcher_once(env)
+    stop_kiosk()
+    start_launcher_once()
 
 
-def reload_browser(env: Dict[str, str]) -> None:
+def reload_browser() -> None:
     """
-    Reload kiosk chromium.
-    If chromium isn't running, start kiosk.
+    Restart kiosk browser service (re-reads kiosk.url).
     """
-    if is_chromium_running():
-        pkill_chromium()
-        time.sleep(0.5)
-        subprocess.Popen([KIOSK_BROWSER], env=env)
-        log("[control] chromium reloaded (kiosk-browser.sh relaunched)")
+    # If service isn't active, starting is a sensible "reload"
+    if is_active(KIOSK_SERVICE):
+        restart_unit(KIOSK_SERVICE)
+        log("[control] kiosk service restarted")
     else:
-        log("[control] chromium not running; starting kiosk")
-        start_kiosk(env)
+        log("[control] kiosk service not active; starting kiosk")
+        start_kiosk()
 
 
-def set_url_and_reload(env: Dict[str, str], url: str) -> None:
+def set_url_and_reload(url: str) -> None:
     url = (url or "").strip()
     if not url:
         log("[control] set_url: empty url; ignored")
@@ -253,7 +269,7 @@ def set_url_and_reload(env: Dict[str, str], url: str) -> None:
         log(f"[control] failed writing kiosk.url: {e}")
         return
 
-    reload_browser(env)
+    reload_browser()
 
 
 # -------------------------------------------------------------------
@@ -311,7 +327,7 @@ def wp_ack_command(prov: Dict[str, Any], cmd_id: int) -> None:
 # Main loop
 # -------------------------------------------------------------------
 
-def handle_command(env: Dict[str, str], cmd: Dict[str, Any]) -> None:
+def handle_command(cmd: Dict[str, Any]) -> None:
     cmd_id = int(cmd.get("id") or 0)
     action = str(cmd.get("action") or "")
     payload = cmd.get("payload") or {}
@@ -321,21 +337,21 @@ def handle_command(env: Dict[str, str], cmd: Dict[str, Any]) -> None:
     log(f"[control] received command id={cmd_id} action={action} payload={payload}")
 
     if action == "enter_kiosk":
-        start_kiosk(env)
+        start_kiosk()
 
     elif action == "exit_kiosk":
-        exit_to_desktop(env)
+        exit_to_desktop()
 
     elif action == "reload":
-        reload_browser(env)
+        reload_browser()
 
     elif action == "set_url":
-        set_url_and_reload(env, str(payload.get("url") or ""))
+        set_url_and_reload(str(payload.get("url") or ""))
 
     elif action == "update_code":
         branch = str(payload.get("branch") or "main")
         log(f"[control] update_code starting (branch={branch})")
-        subprocess.Popen(["bash", UPDATE_SCRIPT, branch], env=env)
+        subprocess.Popen(["bash", UPDATE_SCRIPT, branch])
 
     elif action == "reboot":
         log("[control] reboot requested")
@@ -350,8 +366,6 @@ def handle_command(env: Dict[str, str], cmd: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    env = build_env_for_gui()
-
     prov = load_provision()
     if not prov:
         log("[control] ERROR: missing /boot/provision.json")
@@ -379,7 +393,7 @@ def main() -> None:
                 continue
 
             # Execute
-            handle_command(env, cmd)
+            handle_command(cmd)
 
             # Mark handled + ack
             if cmd_id:
