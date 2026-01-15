@@ -2,7 +2,7 @@
 Type=Application
 Name=Exit Meadow Kiosk
 Comment=Exit Meadow kiosk mode and return to desktop
-Exec=bash -lc '/home/meadow/exit-kiosk.sh >> /home/meadow/state/exit-kiosk.log 2>&1'
+Exec=bash -lc 'sudo systemctl stop meadow-kiosk-browser.service; sudo systemctl start meadow-launcher.service'
 Icon=system-shutdown
 Terminal=false
 Categories=Utility;
