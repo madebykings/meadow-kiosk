@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Absolute path to this repo (used for copying helper scripts)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 echo "=== Updating system ==="
 sudo apt update
 sudo apt upgrade -y
@@ -15,6 +18,7 @@ sudo apt install -y \
   chromium \
   unclutter \
   xbindkeys \
+  dbus-x11 \
   modemmanager
 
 echo "=== Ensure Meadow home ==="
@@ -55,6 +59,25 @@ cat <<'EOF' > /home/meadow/.config/lxsession/LXDE-pi/autostart
 EOF
 sudo chown -R meadow:meadow /home/meadow/.config
 
+echo "=== Configure autostart for Wayland/Labwc (XDG + systemd user) ==="
+# XDG autostart (works on many desktops, including some Wayland sessions)
+sudo -u meadow mkdir -p /home/meadow/.config/autostart
+sudo cp -f "$SCRIPT_DIR/autostart/meadow-launcher.desktop" /home/meadow/.config/autostart/meadow-launcher.desktop
+sudo chown meadow:meadow /home/meadow/.config/autostart/meadow-launcher.desktop
+
+# systemd --user (most reliable across environments)
+sudo -u meadow mkdir -p /home/meadow/.config/systemd/user
+sudo cp -f "$SCRIPT_DIR/systemd-user/meadow-launcher.service" /home/meadow/.config/systemd/user/meadow-launcher.service
+sudo chown -R meadow:meadow /home/meadow/.config/systemd
+
+# Allow the meadow user's services to run at boot without an interactive login
+sudo loginctl enable-linger meadow || true
+
+# Enable the user service (ignore failures if no user session is active yet)
+sudo -u meadow systemctl --user daemon-reload || true
+sudo -u meadow systemctl --user enable meadow-launcher.service || true
+sudo -u meadow systemctl --user restart meadow-launcher.service || true
+
 
 
 echo "=== Desktop icons (Enter/Exit kiosk) ==="
@@ -73,10 +96,9 @@ sudo systemctl enable meadow-remote-control
 sudo systemctl restart meadow-kiosk || true
 sudo systemctl restart meadow-remote-control || true
 
-echo "=== Install complete. Reboot recommended. ==="
-
-
-# Update script (remote 'update_code' command)
+echo "=== Install update helper (remote 'update_code' command) ==="
 sudo cp -f "$SCRIPT_DIR/update-meadow.sh" /home/meadow/update-meadow.sh
 sudo chmod +x /home/meadow/update-meadow.sh
 sudo chown meadow:meadow /home/meadow/update-meadow.sh
+
+echo "=== Install complete. Reboot recommended. ==="
