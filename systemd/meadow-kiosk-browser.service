@@ -1,20 +1,26 @@
-# repo: systemd/meadow-kiosk-browser.service
 [Unit]
 Description=Meadow Kiosk Browser (Chromium watchdog loop)
-After=network-online.target graphical.target
+After=graphical.target network-online.target
 Wants=network-online.target
+
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
 User=meadow
-WorkingDirectory=/home/meadow
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/meadow/.Xauthority
+
+# Start the watchdog loop
 ExecStart=/bin/bash /home/meadow/kiosk-browser.sh
+
+# Stop: touch stop flag and kill chromium kiosk
+ExecStop=/bin/bash -lc 'touch /tmp/meadow_kiosk_stop; pkill -f "chromium.*--kiosk" || true; pkill -f "chromium-browser.*--kiosk" || true'
+
 Restart=on-failure
-RestartSec=2
-StartLimitIntervalSec=60
-StartLimitBurst=10
+RestartSec=3
+
 StandardOutput=journal
 StandardError=journal
 
