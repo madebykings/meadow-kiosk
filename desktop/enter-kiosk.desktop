@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Enter Meadow Kiosk
+Comment=Launch Meadow kiosk mode (fullscreen)
+Exec=/home/meadow/kiosk-browser.sh
+Icon=video-display
+Terminal=false
+Categories=Utility;
