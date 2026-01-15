@@ -5,5 +5,3 @@
 sleep 2
 
 python3 /home/meadow/kiosk-launcher.py >> /home/meadow/launcher.log 2>&1 &
-
-chmod +x labwc/autostart
