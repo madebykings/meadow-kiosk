@@ -279,21 +279,32 @@ def set_url_and_reload(url: str) -> None:
 def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     api = wp_api_base(prov)
     kiosk_id = int(cfg.get("kiosk_id") or 0)
-    key = prov.get("api_key") or ""
 
-    if not api or not kiosk_id or not key:
+    # WP expects a "key" — use kiosk_token (per provision.json)
+    kiosk_token = str(prov.get("kiosk_token") or "").strip()
+
+    # Keep api_key too (some endpoints may still use it)
+    api_key = str(prov.get("api_key") or "").strip()
+
+    if not api or not kiosk_id or not kiosk_token:
         return None
 
     params = {
         "kiosk_id": kiosk_id,
         "scope": CONTROL_SCOPE,
+        "key": kiosk_token,           # ✅ THIS is the fix
         "_t": int(time.time()),
     }
 
     headers = {
-        "X-API-KEY": str(key),
         "Cache-Control": "no-store",
     }
+
+    # Back-compat: if WP checks header instead of query param
+    if api_key:
+        headers["X-API-KEY"] = api_key
+    # Extra back-compat: some versions might look for token in header
+    headers["X-KIOSK-TOKEN"] = kiosk_token
 
     url = api + "/next-command"
 
@@ -303,7 +314,7 @@ def wp_get_next_command(prov: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[D
     except requests.HTTPError as e:
         body = ""
         try:
-            body = (r.text or "")[:1200]  # log enough to see WP error code/message
+            body = (r.text or "")[:1200]
         except Exception:
             pass
         log(f"[control] next-command HTTP error: {e} body={body}")
