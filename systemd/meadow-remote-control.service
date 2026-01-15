@@ -1,0 +1,21 @@
+[Unit]
+Description=Meadow Remote Control (kiosk enter/exit/reload/url)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meadow
+WorkingDirectory=/home/meadow/meadow-kiosk
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/meadow/.Xauthority
+ExecStart=/usr/bin/python3 /home/meadow/meadow-kiosk/remote_control.py
+Restart=always
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
