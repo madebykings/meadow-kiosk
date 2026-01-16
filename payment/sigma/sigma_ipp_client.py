@@ -15,6 +15,10 @@ Lifecycle (CONFIRMED by your debugging):
   (REVERSAL included as last resort because your tester used it; some firmware needs it)
 - PURCHASE: wait for first matching frame; if STATUS != 0 return it; else continue until final frame.
 
+Important fix:
+- Sigma can still report STATUS=20 *after* a successful purchase. So we run post-purchase
+  ensure_idle() best-effort to clean the terminal for the NEXT customer.
+
 PySerial robustness:
 - Some builds/devices throw BrokenPipeError inside serialposix._update_dtr_state() while opening
 - Some pyserial builds do NOT support do_not_open=True
@@ -152,7 +156,6 @@ def _open_serial_safely(port: str, baudrate: int, timeout: float) -> serial.Seri
     Open Serial without relying on do_not_open=True (not available in some pyserial builds),
     and avoid fatal BrokenPipeError from DTR ioctl by temporarily patching _update_dtr_state.
     """
-    # Create without opening by passing port=None
     ser = serial.Serial(
         port=None,
         baudrate=baudrate,
@@ -162,7 +165,6 @@ def _open_serial_safely(port: str, baudrate: int, timeout: float) -> serial.Seri
     )
     ser.port = port
 
-    # Patch serialposix.Serial._update_dtr_state to ignore errno 32 during open
     orig = None
     patched = False
     try:
@@ -182,10 +184,8 @@ def _open_serial_safely(port: str, baudrate: int, timeout: float) -> serial.Seri
                 sp.Serial._update_dtr_state = _safe_update_dtr_state  # type: ignore
                 patched = True
         except Exception:
-            # If serialposix isn't present (non-posix), just proceed
             pass
 
-        # Now open; if it still raises BrokenPipeError, keep going (fd often valid)
         try:
             ser.open()
         except BrokenPipeError:
@@ -230,7 +230,6 @@ class SigmaIppClient:
 
         self._ser = _open_serial_safely(self.port, self.baudrate, self.read_timeout)
 
-        # Best-effort line toggle — NEVER fatal
         _toggle_lines_safe(self._ser)
 
         try:
@@ -279,6 +278,10 @@ class SigmaIppClient:
         return sid
 
     def _drain(self, seconds: float = 1.0, label: str = "drain") -> None:
+        """
+        Read and log any frames for up to `seconds`. Stops early when nothing arrives.
+        (Useful as a best-effort pre-drain, but do NOT use for protocol correctness.)
+        """
         if not self._ser or not self._ser.is_open:
             self.open()
         assert self._ser is not None
@@ -287,7 +290,7 @@ class SigmaIppClient:
         while time.time() < end:
             got = _read_one_frame(self._ser, timeout_s=0.25)
             if not got:
-                continue
+                break  # ✅ stop early when no data
             props, raw = got
             self.log.debug(f"RX ({label}) {props} RAW={raw!r}")
 
@@ -309,7 +312,6 @@ class SigmaIppClient:
             self.open()
         assert self._ser is not None
 
-        # First matching response
         end_first = time.time() + float(first_wait)
         first: Optional[Dict[str, str]] = None
         first_raw: str = ""
@@ -333,7 +335,6 @@ class SigmaIppClient:
         if str(first.get("STATUS") or "") != "0":
             return SigmaFrame(props=first, raw_text=first_raw, sid=sid, method=method)
 
-        # Continue until final frame
         last = first
         last_raw = first_raw
         end = time.time() + float(final_wait)
@@ -354,6 +355,19 @@ class SigmaIppClient:
 
         return SigmaFrame(props=last, raw_text=last_raw, sid=sid, method=method)
 
+    def _send_and_wait_final(
+        self,
+        method: str,
+        extra_lines: Optional[List[str]] = None,
+        first_wait: float = 6.0,
+        final_wait: float = 25.0,
+    ) -> Optional[SigmaFrame]:
+        """
+        Send METHOD and wait for its response frames to complete (final TIMEOUT=0/missing).
+        """
+        sid = self._send_method(method, extra_lines=extra_lines)
+        return self._wait_for_sid(method, sid, first_wait=first_wait, final_wait=final_wait, log_other=True)
+
     # -----------------------------
     # Status / idle handling
     # -----------------------------
@@ -370,18 +384,18 @@ class SigmaIppClient:
     def ensure_idle(self, max_total_wait: float = 45.0) -> bool:
         """
         Bring terminal to IDLE (STATUS=0). If STATUS=20, run recovery sequence:
-          COMPLETE_TX -> CANCEL_TX -> (optional) REVERSAL
-        Always polls GET_STATUS(final) after each step.
+          COMPLETE_TX -> CANCEL_TX -> poll GET_STATUS(final) until STATUS == 0
+        REVERSAL is last resort.
         """
         deadline = time.time() + float(max_total_wait)
 
+        # Best-effort: clear any stale frames so we start clean
         self._drain(seconds=1.0, label="pre-ensure-idle")
 
         st = self.get_status_final(max_wait=6.0)
         if not st:
             self.log.debug("No GET_STATUS response")
             return False
-
         if self._is_idle(st):
             return True
 
@@ -390,32 +404,33 @@ class SigmaIppClient:
             self.log.debug(f"Not idle. STATUS={code}")
 
             if code == "20":
-                self._send_method("COMPLETE_TX")
-                self._drain(seconds=2.0, label="after-COMPLETE_TX")
-                time.sleep(1.0)
+                # ✅ Deterministic: wait for COMPLETE/CANCEL responses rather than draining randomly
+                self._send_and_wait_final("COMPLETE_TX", first_wait=6.0, final_wait=30.0)
+                self._send_and_wait_final("CANCEL_TX", first_wait=6.0, final_wait=30.0)
+
+                # Poll until idle or deadline
+                while time.time() < deadline:
+                    st = self.get_status_final(max_wait=6.0)
+                    if self._is_idle(st):
+                        return True
+                    if str((st or {}).get("STATUS") or "") == "20":
+                        time.sleep(0.6)
+                        continue
+                    time.sleep(0.6)
+
+                # last resort
+                self._send_and_wait_final("REVERSAL", first_wait=6.0, final_wait=35.0)
                 st = self.get_status_final(max_wait=6.0)
                 if self._is_idle(st):
                     return True
 
-                self._send_method("CANCEL_TX")
-                self._drain(seconds=2.0, label="after-CANCEL_TX")
-                time.sleep(1.0)
-                st = self.get_status_final(max_wait=6.0)
-                if self._is_idle(st):
-                    return True
+                return False
 
-                self._send_method("REVERSAL")
-                self._drain(seconds=3.0, label="after-REVERSAL")
-                time.sleep(1.0)
-                st = self.get_status_final(max_wait=6.0)
-                if self._is_idle(st):
-                    return True
-
-            else:
-                time.sleep(1.0)
-                st = self.get_status_final(max_wait=6.0)
-                if self._is_idle(st):
-                    return True
+            # For any other non-idle code, just keep polling a bit
+            time.sleep(0.8)
+            st = self.get_status_final(max_wait=6.0)
+            if self._is_idle(st):
+                return True
 
         return False
 
@@ -438,7 +453,9 @@ class SigmaIppClient:
         if not self._ser or not self._ser.is_open:
             self.open()
 
+        # Best-effort: flush any stray frames before starting
         self._drain(seconds=2.0, label="pre-purchase-drain")
+
         if not self.ensure_idle(max_total_wait=45.0):
             raise SigmaTimeout("Terminal not idle before purchase")
 
@@ -464,6 +481,12 @@ class SigmaIppClient:
         timeout = str(props.get("TIMEOUT") or "")
 
         approved = (status == "0")
+
+        # ✅ CRITICAL: clean terminal for NEXT transaction (Sigma sometimes leaves STATUS=20 after success)
+        try:
+            self.ensure_idle(max_total_wait=20.0)
+        except Exception as e:
+            self.log.debug(f"post-purchase ensure_idle failed: {e!r}")
 
         return {
             "approved": approved,
