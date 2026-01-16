@@ -21,6 +21,8 @@ Notes:
   - Admin endpoints REQUIRE kiosk_id + key (from cfg.api_key in WP config).
   - Kiosk mode control uses STOP_FLAG + direct launch of kiosk-browser.sh (no systemd required).
   - Sigma calls are guarded by a single lock so warmup can never overlap purchase.
+  - Locking is BOTH in-process (threading) and cross-process (fcntl flock) to prevent overlap even if
+    pi_api is accidentally started twice.
 """
 
 from __future__ import annotations
@@ -33,6 +35,9 @@ import traceback
 import subprocess
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional, Tuple
+
+import errno
+import fcntl
 
 import requests
 
@@ -64,9 +69,103 @@ HEARTBEAT_SECS = int(os.environ.get("MEADOW_HEARTBEAT_SECS", "60"))
 # -------------------------------------------------------------------
 # Sigma concurrency guard (warmup + purchase share one serial port)
 # -------------------------------------------------------------------
-SIGMA_LOCK = threading.Lock()
-SIGMA_WARM_MAX_WAIT_SECS = 8.0   # keep warm bounded (fast)
-SIGMA_BUSY_LOCK_TIMEOUT = 0.1    # if Sigma is busy, warmup returns immediately
+# In-process lock (threads)
+_SIGMA_THREAD_LOCK = threading.Lock()
+
+# Cross-process lock (prevents overlap if pi_api is started twice)
+SIGMA_LOCKFILE = os.environ.get("MEADOW_SIGMA_LOCKFILE", "/tmp/meadow_sigma.lock")
+
+# Warmup should be fast + never block UI if Sigma is in-use
+SIGMA_WARM_MAX_WAIT_SECS = 8.0     # bounded ensure_idle
+SIGMA_BUSY_LOCK_TIMEOUT = 0.10     # if Sigma busy, warmup returns immediately
+
+# Purchases can wait a bit longer to serialize safely
+SIGMA_PURCHASE_LOCK_TIMEOUT = 10.0  # seconds to wait for lock before returning 503
+
+
+class _SigmaGlobalLock:
+    """
+    Composite lock:
+      1) threading.Lock (prevents overlap inside this process)
+      2) fcntl.flock on SIGMA_LOCKFILE (prevents overlap across processes)
+    """
+
+    def __init__(self, lockfile: str) -> None:
+        self.lockfile = lockfile
+        self._fd: Optional[int] = None
+        self._held_thread = False
+
+    def acquire(self, timeout: float) -> bool:
+        deadline = time.time() + max(0.0, float(timeout))
+
+        # 1) Thread lock (block/poll until timeout)
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            got = _SIGMA_THREAD_LOCK.acquire(timeout=min(0.25, remaining))
+            if got:
+                self._held_thread = True
+                break
+
+        # 2) File lock (non-busy loop until timeout)
+        try:
+            # Ensure file exists, keep fd open while locked
+            fd = os.open(self.lockfile, os.O_CREAT | os.O_RDWR, 0o666)
+            self._fd = fd
+
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    self.release()
+                    return False
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    # Stamp some debug info (best-effort)
+                    try:
+                        os.ftruncate(fd, 0)
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        os.write(fd, f"pid={os.getpid()} ts={int(time.time())}\n".encode("utf-8"))
+                    except Exception:
+                        pass
+                    return True
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EAGAIN):
+                        # Unexpected lock error -> treat as failure
+                        self.release()
+                        return False
+                    time.sleep(0.05)
+
+        except Exception:
+            self.release()
+            return False
+
+    def release(self) -> None:
+        # Release file lock
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(self._fd)
+            except Exception:
+                pass
+            self._fd = None
+
+        # Release thread lock
+        if self._held_thread:
+            try:
+                _SIGMA_THREAD_LOCK.release()
+            except Exception:
+                pass
+            self._held_thread = False
+
+    def __enter__(self) -> "_SigmaGlobalLock":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
 
 
 # -------------------------------------------------------------------
@@ -273,6 +372,7 @@ class RuntimeState:
                 "cached_imei": self._cached_imei,
                 "sigma_path": self._sigma_path,
                 "sigma_baud": self._sigma_baud,
+                "sigma_lockfile": SIGMA_LOCKFILE,
                 "motors_loaded": self._motors is not None,
                 "kiosk": {
                     "script": KIOSK_SCRIPT,
@@ -505,6 +605,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "sigma_path": snap["sigma_path"],
                 "sigma_baud": snap["sigma_baud"],
+                "sigma_lockfile": snap["sigma_lockfile"],
                 "motors_loaded": snap["motors_loaded"],
                 "last_config_ok": snap["last_config_ok"],
                 "last_config_ts": snap["last_config_ts"],
@@ -547,8 +648,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_sigma_warm(self) -> None:
         """
         Warm Sigma on browse screen:
-        - If a purchase is running, do NOT interfere: return warm_skipped immediately.
-        - Otherwise run ensure_idle() (bounded), which performs STATUS=20 recovery if needed.
+        - If a purchase is running (or another warmup), do NOT interfere: return warm_skipped immediately.
+        - Otherwise run ensure_idle() (bounded), which performs STATUS=20 recovery if needed:
+            COMPLETE_TX -> CANCEL_TX -> wait for GET_STATUS(TIMEOUT=0) to show STATUS=0
         """
         _ = _read_json(self)  # optional body, ignored
         sigma_path, sigma_baud = STATE.get_sigma()
@@ -556,8 +658,8 @@ class Handler(BaseHTTPRequestHandler):
 
         t0 = time.time()
 
-        locked = SIGMA_LOCK.acquire(timeout=SIGMA_BUSY_LOCK_TIMEOUT)
-        if not locked:
+        lock = _SigmaGlobalLock(SIGMA_LOCKFILE)
+        if not lock.acquire(timeout=SIGMA_BUSY_LOCK_TIMEOUT):
             return _json_response(self, 200, {
                 "ok": True,
                 "warm_skipped": True,
@@ -572,12 +674,12 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 try:
                     with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
-                        ok = sigma.ensure_idle(max_total_wait=SIGMA_WARM_MAX_WAIT_SECS)
+                        idle_ok = sigma.ensure_idle(max_total_wait=SIGMA_WARM_MAX_WAIT_SECS)
 
                     return _json_response(self, 200, {
                         "ok": True,
                         "warm_skipped": False,
-                        "idle_ok": bool(ok),
+                        "idle_ok": bool(idle_ok),
                         "port": port,
                         "t_ms": int((time.time() - t0) * 1000),
                     })
@@ -594,10 +696,7 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         finally:
-            try:
-                SIGMA_LOCK.release()
-            except Exception:
-                pass
+            lock.release()
 
     def _handle_sigma_purchase(self) -> None:
         data = _read_json(self)
@@ -612,10 +711,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return _json_response(self, 400, {"ok": False, "error": "bad_amount"})
 
-        # Guard: never allow warmup to overlap purchase.
-        acquired = SIGMA_LOCK.acquire(timeout=5.0)
-        if not acquired:
-            return _json_response(self, 503, {"ok": False, "error": "sigma_busy_try_again"})
+        # Guard: never allow warmup to overlap purchase (and prevent multi-process overlap too)
+        t0 = time.time()
+        lock = _SigmaGlobalLock(SIGMA_LOCKFILE)
+        if not lock.acquire(timeout=SIGMA_PURCHASE_LOCK_TIMEOUT):
+            return _json_response(self, 503, {
+                "ok": False,
+                "error": "sigma_busy_try_again",
+                "t_ms": int((time.time() - t0) * 1000),
+            })
 
         try:
             sigma_path, sigma_baud = STATE.get_sigma()
@@ -628,6 +732,9 @@ class Handler(BaseHTTPRequestHandler):
 
                 try:
                     with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
+                        # purchase() should internally:
+                        #  - ensure_idle() first (including STATUS=20 recovery: COMPLETE_TX -> CANCEL_TX -> STATUS=0)
+                        #  - wait for final frame with TIMEOUT=0 after purchase completes
                         r = sigma.purchase(
                             amount_minor=amount_minor_int,
                             currency_num=currency_num,
@@ -652,8 +759,10 @@ class Handler(BaseHTTPRequestHandler):
                         "receipt": raw.get("RECEIPT", ""),
                         "txid": str(raw.get("TXID") or raw.get("RRN") or ""),
                         "port": port,
+                        "t_ms": int((time.time() - t0) * 1000),
                     }
 
+                    # Non-zero STATUS at stage 5 etc = user-decline / error (treat as rejected)
                     if status and status != "0" and not approved:
                         return _json_response(self, 409, {"ok": False, "error": "sigma_rejected", **payload})
 
@@ -666,10 +775,7 @@ class Handler(BaseHTTPRequestHandler):
             return _json_response(self, 502, {"ok": False, "error": "sigma_failed", "detail": last_err})
 
         finally:
-            try:
-                SIGMA_LOCK.release()
-            except Exception:
-                pass
+            lock.release()
 
     def _handle_vend(self) -> None:
         data = _read_json(self)
