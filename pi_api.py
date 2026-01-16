@@ -507,24 +507,24 @@ def _enter_kiosk() -> Tuple[bool, str]:
         if not os.path.exists(KIOSK_SCRIPT):
             return False, f"missing_script:{KIOSK_SCRIPT}"
 
-        # Start kiosk browser script
-        # NOTE: this inherits environment from the calling process; ensure kiosk-browser.sh
-        # sets DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR if needed.
+        # Start kiosk browser script with a display/session environment
         env = os.environ.copy()
-env.setdefault("DISPLAY", ":0")
-env.setdefault("XAUTHORITY", "/home/meadow/.Xauthority")
-env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
+        env.setdefault("DISPLAY", ":0")
+        env.setdefault("XAUTHORITY", "/home/meadow/.Xauthority")
+        env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
 
-p = subprocess.Popen(
-    ["bash", KIOSK_SCRIPT],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    env=env,
-)
+        p = subprocess.Popen(
+            ["bash", KIOSK_SCRIPT],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+
         _write_pidfile(p.pid)
         return True, ""
     except Exception as e:
         return False, str(e)
+
 
 
 def _exit_kiosk() -> Tuple[bool, str]:
