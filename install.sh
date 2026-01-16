@@ -34,7 +34,7 @@ sudo mkdir -p /home/meadow/meadow-kiosk
 sudo cp -f "$SCRIPT_DIR/kiosk-browser.sh" /home/meadow/kiosk-browser.sh
 sudo cp -f "$SCRIPT_DIR/offline.html" /home/meadow/offline.html
 
-# exit-kiosk.sh (overwrite with updated version)
+# exit-kiosk.sh (hotkey target; no legacy services)
 cat <<'EOF' | sudo tee /home/meadow/exit-kiosk.sh >/dev/null
 #!/bin/bash
 set -euo pipefail
@@ -71,7 +71,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable meadow-kiosk.service
 sudo systemctl restart meadow-kiosk.service
 
-echo "=== Install user systemd service (Kiosk UI) ==="
+echo "=== Install user systemd service file (Kiosk UI) ==="
 sudo -u meadow mkdir -p /home/meadow/.config/systemd/user
 cat <<'EOF' | sudo -u meadow tee /home/meadow/.config/systemd/user/meadow-kiosk-ui.service >/dev/null
 [Unit]
@@ -89,12 +89,8 @@ RestartSec=2
 WantedBy=default.target
 EOF
 
-echo "=== Enable lingering for meadow (allow user services at boot) ==="
+echo "=== Enable lingering for meadow (allows user services at boot once enabled) ==="
 sudo loginctl enable-linger meadow
-
-echo "=== Enable user kiosk-ui service ==="
-sudo -u meadow systemctl --user daemon-reload
-sudo -u meadow systemctl --user enable meadow-kiosk-ui.service || true
 
 echo "=== Desktop + menu launcher (Enter kiosk) ==="
 sudo mkdir -p /home/meadow/Desktop
@@ -111,9 +107,16 @@ EOF
 sudo chmod +x "/home/meadow/Desktop/Enter Meadow Kiosk.desktop"
 sudo chown -R meadow:meadow /home/meadow/Desktop
 
+# Also install to app menu (Wayland-friendly)
 sudo -u meadow mkdir -p /home/meadow/.local/share/applications
 sudo -u meadow cp -f "/home/meadow/Desktop/Enter Meadow Kiosk.desktop" "/home/meadow/.local/share/applications/Enter Meadow Kiosk.desktop"
 
 echo "=== Install complete ==="
-echo "Wayland note: launch via menu or: gtk-launch 'Enter Meadow Kiosk'"
-echo "To start kiosk now: sudo -u meadow systemctl --user restart meadow-kiosk-ui.service"
+echo ""
+echo "NEXT STEPS (run once after logging into the meadow desktop session):"
+echo "  systemctl --user daemon-reload"
+echo "  systemctl --user enable meadow-kiosk-ui.service"
+echo "  systemctl --user restart meadow-kiosk-ui.service"
+echo ""
+echo "Wayland: you can launch from menu (recommended) or run:"
+echo "  gtk-launch \"Enter Meadow Kiosk\""
