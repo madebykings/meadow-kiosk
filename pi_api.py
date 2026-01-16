@@ -8,7 +8,6 @@ Fast local endpoints (no WP latency):
 Admin endpoints (require kiosk_id + key):
   POST /admin/vend-test           { kiosk_id:int, key:str, motor:int }
   POST /admin/control             { kiosk_id:int, key:str, action:str, payload?:object }
-  POST /admin/consume-wp-command  { kiosk_id:int, key:str, scope?:'vend'|'control' }
 
 Health/debug:
   GET  /health
@@ -18,6 +17,7 @@ Health/debug:
 Notes:
   - Binds to 127.0.0.1 only. Cloudflare Tunnel publishes it externally.
   - Admin endpoints REQUIRE kiosk_id + key (from cfg.api_key in WP config).
+  - Kiosk mode control uses STOP_FLAG + direct launch of kiosk-browser.sh (no systemd required).
 """
 
 from __future__ import annotations
@@ -48,10 +48,11 @@ WP_HEARTBEAT_FILE = os.environ.get("MEADOW_WP_HEARTBEAT_FILE", "/tmp/meadow_wp_h
 KIOSK_URL_FILE = os.environ.get("MEADOW_KIOSK_URL_FILE", "/home/meadow/kiosk.url")
 STOP_FLAG = os.environ.get("MEADOW_KIOSK_STOP_FLAG", "/tmp/meadow_kiosk_stop")
 
-UPDATE_SCRIPT = os.environ.get("MEADOW_UPDATE_SCRIPT", "/home/meadow/update-meadow.sh")
+# Direct kiosk control (no systemd)
+KIOSK_SCRIPT = os.environ.get("MEADOW_KIOSK_SCRIPT", "/home/meadow/kiosk-browser.sh")
+KIOSK_PIDFILE = os.environ.get("MEADOW_KIOSK_PIDFILE", "/tmp/meadow_kiosk_browser.pid")
 
-# If you want these actions to call systemd:
-KIOSK_BROWSER_UNIT = os.environ.get("MEADOW_KIOSK_BROWSER_UNIT", "meadow-kiosk-browser.service")
+UPDATE_SCRIPT = os.environ.get("MEADOW_UPDATE_SCRIPT", "/home/meadow/update-meadow.sh")
 
 # Poll WP config every N seconds
 CONFIG_POLL_SECS = int(os.environ.get("MEADOW_CONFIG_POLL_SECS", "30"))
@@ -105,9 +106,28 @@ def _git_short_hash() -> str:
         return ""
 
 
-def _systemctl(*args: str) -> int:
-    # Needs sudoers drop-in to allow meadow to run systemctl without password
-    return subprocess.call(["sudo", "systemctl", *args])
+def _pid_is_running(pid: int) -> bool:
+    return pid > 1 and os.path.exists(f"/proc/{pid}")
+
+
+def _read_pidfile() -> int:
+    try:
+        with open(KIOSK_PIDFILE, "r", encoding="utf-8") as f:
+            return int((f.read() or "").strip() or "0")
+    except Exception:
+        return 0
+
+
+def _write_pidfile(pid: int) -> None:
+    try:
+        with open(KIOSK_PIDFILE, "w", encoding="utf-8") as f:
+            f.write(str(int(pid)) + "\n")
+    except Exception:
+        pass
+
+
+def _kiosk_running() -> bool:
+    return _pid_is_running(_read_pidfile())
 
 
 # -------------------------------------------------------------------
@@ -214,6 +234,13 @@ class RuntimeState:
                 "sigma_path": self._sigma_path,
                 "sigma_baud": self._sigma_baud,
                 "motors_loaded": self._motors is not None,
+                "kiosk": {
+                    "script": KIOSK_SCRIPT,
+                    "pidfile": KIOSK_PIDFILE,
+                    "running": _kiosk_running(),
+                    "stop_flag_exists": os.path.exists(STOP_FLAG),
+                    "url_file": KIOSK_URL_FILE,
+                },
             }
 
     def get_sigma(self) -> Tuple[str, int]:
@@ -317,48 +344,7 @@ def _config_poll_loop() -> None:
 
 
 # -------------------------------------------------------------------
-# One-shot WP command consume (no daemon)
-# -------------------------------------------------------------------
-
-def _wp_api_base(domain: str) -> str:
-    return domain.rstrip("/") + "/wp-json/meadow/v1"
-
-
-def _wp_next_command(domain: str, kiosk_id: int, key: str, scope: str) -> Optional[Dict[str, Any]]:
-    url = _wp_api_base(domain) + "/next-command"
-    params = {
-        "kiosk_id": int(kiosk_id),
-        "key": str(key),
-        "scope": str(scope or "vend"),
-        "_t": int(time.time()),
-    }
-    r = requests.get(url, params=params, timeout=10)
-    if r.status_code != 200:
-        return None
-    try:
-        data = r.json()
-    except Exception:
-        return None
-    if isinstance(data, list):
-        if not data:
-            return None
-        data = data[0]
-    if not isinstance(data, dict) or not data.get("id"):
-        return None
-    return data
-
-
-def _wp_ack_command(domain: str, kiosk_id: int, key: str, cmd_id: int) -> Tuple[bool, str]:
-    url = _wp_api_base(domain) + "/command-complete"
-    payload = {"id": int(cmd_id), "kiosk_id": int(kiosk_id), "key": str(key), "ts": int(time.time())}
-    r = requests.post(url, json=payload, timeout=10)
-    if r.status_code != 200:
-        return False, (r.text or "")[:400]
-    return True, ""
-
-
-# -------------------------------------------------------------------
-# Local control actions (systemd + files)
+# Local control actions (files + direct script launch)
 # -------------------------------------------------------------------
 
 def _enter_kiosk() -> Tuple[bool, str]:
@@ -369,8 +355,16 @@ def _enter_kiosk() -> Tuple[bool, str]:
                 os.remove(STOP_FLAG)
         except Exception:
             pass
-        rc = _systemctl("start", KIOSK_BROWSER_UNIT)
-        return (rc == 0), ("" if rc == 0 else f"systemctl start failed rc={rc}")
+
+        if _kiosk_running():
+            return True, "already_running"
+
+        if not os.path.exists(KIOSK_SCRIPT):
+            return False, f"missing_script:{KIOSK_SCRIPT}"
+
+        p = subprocess.Popen(["bash", KIOSK_SCRIPT], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _write_pidfile(p.pid)
+        return True, ""
     except Exception as e:
         return False, str(e)
 
@@ -383,18 +377,32 @@ def _exit_kiosk() -> Tuple[bool, str]:
                 f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
         except Exception:
             pass
-        rc = _systemctl("stop", KIOSK_BROWSER_UNIT)
-        return (rc == 0), ("" if rc == 0 else f"systemctl stop failed rc={rc}")
+
+        # Best-effort stop: kill the script pid, plus chromium kiosk procs
+        pid = _read_pidfile()
+        if _pid_is_running(pid):
+            try:
+                os.kill(pid, 15)  # SIGTERM
+            except Exception:
+                pass
+
+        # Ensure kiosk chromium is gone
+        subprocess.call(["pkill", "-f", "chromium.*--kiosk"])
+        subprocess.call(["pkill", "-f", "chromium-browser.*--kiosk"])
+        subprocess.call(["pkill", "-f", "chromium --kiosk"])
+        subprocess.call(["pkill", "-f", "chromium-browser --kiosk"])
+
+        return True, ""
     except Exception as e:
         return False, str(e)
 
 
 def _reload_kiosk() -> Tuple[bool, str]:
-    try:
-        rc = _systemctl("restart", KIOSK_BROWSER_UNIT)
-        return (rc == 0), ("" if rc == 0 else f"systemctl restart failed rc={rc}")
-    except Exception as e:
-        return False, str(e)
+    ok, err = _exit_kiosk()
+    if not ok:
+        return False, err
+    time.sleep(0.5)
+    return _enter_kiosk()
 
 
 def _set_url(url: str) -> Tuple[bool, str]:
@@ -457,6 +465,8 @@ class Handler(BaseHTTPRequestHandler):
                 "last_config_ok": snap["last_config_ok"],
                 "last_config_ts": snap["last_config_ts"],
                 "last_config_error": snap["last_config_error"],
+                "kiosk_running": snap["kiosk"]["running"],
+                "stop_flag_exists": snap["kiosk"]["stop_flag_exists"],
             })
 
         if self.path.startswith("/debug/config"):
@@ -484,9 +494,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/admin/control"):
             return self._handle_admin_control()
-
-        if self.path.startswith("/admin/consume-wp-command"):
-            return self._handle_admin_consume_wp_command()
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
@@ -544,7 +551,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 return _json_response(self, 200, {"ok": True, **payload})
 
-            except Exception:
+            except Exception as e:
                 last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
                 continue
 
@@ -639,87 +646,6 @@ class Handler(BaseHTTPRequestHandler):
             return _json_response(self, 400, {"ok": False, "error": "unknown_action", "action": action})
 
         return _json_response(self, 200, {"ok": True, "action": action, "action_ok": a_ok, "action_err": a_err})
-
-    def _handle_admin_consume_wp_command(self) -> None:
-        """
-        One-shot:
-          - fetch ONE queued command from WP (/next-command?kiosk_id&key&scope=vend/control)
-          - execute locally if it's a vend/spin_motor (and optionally basic control)
-          - ack back to WP (/command-complete with {id,kiosk_id,key})
-        """
-        data = _read_json(self)
-        ok, err = _auth_admin(data)
-        if not ok:
-            return _json_response(self, 403, {"ok": False, "error": err})
-
-        kiosk_id, key, domain = STATE.get_auth()
-        if not domain:
-            return _json_response(self, 503, {"ok": False, "error": "no_domain"})
-
-        scope = str(data.get("scope") or "vend").strip().lower()
-        if scope not in ("vend", "control"):
-            scope = "vend"
-
-        cmd = _wp_next_command(domain, kiosk_id, key, scope)
-        if not cmd:
-            return _json_response(self, 200, {"ok": True, "found": False})
-
-        cmd_id = int(cmd.get("id") or 0)
-        action = str(cmd.get("action") or "")
-        payload = cmd.get("payload") or {}
-        if not isinstance(payload, dict):
-            payload = {}
-
-        exec_ok = False
-        exec_err = ""
-
-        try:
-            if action in ("vend", "spin_motor"):
-                motor = int(payload.get("motor") or cmd.get("motor") or 0)
-                if motor <= 0:
-                    raise ValueError("missing_motor")
-                controller = STATE.get_motors()
-                if controller is None:
-                    raise RuntimeError("motors_not_loaded")
-                controller.vend(motor)
-                exec_ok = True
-
-            elif action == "enter_kiosk":
-                exec_ok, exec_err = _enter_kiosk()
-            elif action == "exit_kiosk":
-                exec_ok, exec_err = _exit_kiosk()
-            elif action == "reload":
-                exec_ok, exec_err = _reload_kiosk()
-            elif action == "set_url":
-                u = str(payload.get("url") or "")
-                exec_ok, exec_err = _set_url(u)
-                if exec_ok:
-                    _reload_kiosk()
-            elif action == "update_code":
-                exec_ok, exec_err = _update_code(str(payload.get("branch") or "main"))
-            elif action == "reboot":
-                exec_ok, exec_err = _reboot()
-            elif action == "shutdown":
-                exec_ok, exec_err = _shutdown()
-            else:
-                # Unknown => still ack so it doesn't jam queue
-                exec_ok = True
-
-        except Exception as e:
-            exec_ok = False
-            exec_err = str(e)
-
-        ack_ok, ack_err = _wp_ack_command(domain, kiosk_id, key, cmd_id)
-
-        return _json_response(self, 200, {
-            "ok": True,
-            "found": True,
-            "cmd": {"id": cmd_id, "action": action, "scope": scope},
-            "exec_ok": exec_ok,
-            "exec_err": exec_err,
-            "ack_ok": ack_ok,
-            "ack_err": ack_err,
-        })
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
