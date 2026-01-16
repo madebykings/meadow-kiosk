@@ -97,6 +97,7 @@ BACKOFF="$BACKOFF_START"
 
 while true; do
   if [ -f "$STOP_FLAG" ]; then
+    log "[Meadow] STOP_FLAG present — kiosk start blocked"
     exit 0
   fi
 
