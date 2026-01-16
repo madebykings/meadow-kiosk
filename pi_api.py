@@ -1,8 +1,10 @@
+```py
 #!/usr/bin/env python3
 """Meadow Pi API (via Cloudflare Tunnel)
 
 Fast local endpoints (no WP latency):
   POST /sigma/purchase            { amount_minor:int, currency_num:str|int, reference:str }
+  POST /sigma/warm                { }  (best-effort warmup / ensure_idle; non-blocking if busy)
   POST /vend                      { motor:int }
 
 Admin endpoints (require kiosk_id + key):
@@ -18,6 +20,7 @@ Notes:
   - Binds to 127.0.0.1 only. Cloudflare Tunnel publishes it externally.
   - Admin endpoints REQUIRE kiosk_id + key (from cfg.api_key in WP config).
   - Kiosk mode control uses STOP_FLAG + direct launch of kiosk-browser.sh (no systemd required).
+  - Sigma calls are guarded by a single lock so warmup can never overlap purchase.
 """
 
 from __future__ import annotations
@@ -57,6 +60,13 @@ UPDATE_SCRIPT = os.environ.get("MEADOW_UPDATE_SCRIPT", "/home/meadow/update-mead
 # Poll WP config every N seconds
 CONFIG_POLL_SECS = int(os.environ.get("MEADOW_CONFIG_POLL_SECS", "30"))
 HEARTBEAT_SECS = int(os.environ.get("MEADOW_HEARTBEAT_SECS", "60"))
+
+# -------------------------------------------------------------------
+# Sigma concurrency guard (warmup + purchase share one serial port)
+# -------------------------------------------------------------------
+SIGMA_LOCK = threading.Lock()
+SIGMA_WARM_MAX_WAIT_SECS = 8.0   # keep warm bounded (fast)
+SIGMA_BUSY_LOCK_TIMEOUT = 0.1    # if Sigma is busy, warmup returns immediately
 
 
 # -------------------------------------------------------------------
@@ -517,6 +527,9 @@ class Handler(BaseHTTPRequestHandler):
             _touch(UI_HEARTBEAT_FILE)
             return _json_response(self, 200, {"ok": True})
 
+        if self.path.startswith("/sigma/warm"):
+            return self._handle_sigma_warm()
+
         if self.path.startswith("/sigma/purchase"):
             return self._handle_sigma_purchase()
 
@@ -531,6 +544,61 @@ class Handler(BaseHTTPRequestHandler):
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
+    def _handle_sigma_warm(self) -> None:
+        """
+        Warm Sigma on browse screen:
+        - If a purchase is running, do NOT interfere: return warm_skipped immediately.
+        - Otherwise run ensure_idle() (bounded), which performs STATUS=20 recovery if needed.
+        """
+        _ = _read_json(self)  # optional body, ignored
+        sigma_path, sigma_baud = STATE.get_sigma()
+        port_candidates = [sigma_path, "/dev/sigma", "/dev/ttyACM0", "/dev/ttyUSB0"]
+
+        t0 = time.time()
+
+        locked = SIGMA_LOCK.acquire(timeout=SIGMA_BUSY_LOCK_TIMEOUT)
+        if not locked:
+            return _json_response(self, 200, {
+                "ok": True,
+                "warm_skipped": True,
+                "reason": "sigma_busy",
+                "t_ms": int((time.time() - t0) * 1000),
+            })
+
+        try:
+            last_err = ""
+            for port in port_candidates:
+                if not port or not os.path.exists(port):
+                    continue
+                try:
+                    with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
+                        ok = sigma.ensure_idle(max_total_wait=SIGMA_WARM_MAX_WAIT_SECS)
+
+                    return _json_response(self, 200, {
+                        "ok": True,
+                        "warm_skipped": False,
+                        "idle_ok": bool(ok),
+                        "port": port,
+                        "t_ms": int((time.time() - t0) * 1000),
+                    })
+
+                except Exception as e:
+                    last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
+                    continue
+
+            return _json_response(self, 502, {
+                "ok": False,
+                "error": "sigma_warm_failed",
+                "detail": last_err,
+                "t_ms": int((time.time() - t0) * 1000),
+            })
+
+        finally:
+            try:
+                SIGMA_LOCK.release()
+            except Exception:
+                pass
+
     def _handle_sigma_purchase(self) -> None:
         data = _read_json(self)
         amount_minor = data.get("amount_minor")
@@ -544,52 +612,64 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return _json_response(self, 400, {"ok": False, "error": "bad_amount"})
 
-        sigma_path, sigma_baud = STATE.get_sigma()
-        port_candidates = [sigma_path, "/dev/sigma", "/dev/ttyACM0", "/dev/ttyUSB0"]
+        # Guard: never allow warmup to overlap purchase.
+        acquired = SIGMA_LOCK.acquire(timeout=5.0)
+        if not acquired:
+            return _json_response(self, 503, {"ok": False, "error": "sigma_busy_try_again"})
 
-        last_err = ""
-        for port in port_candidates:
-            if not port or not os.path.exists(port):
-                continue
+        try:
+            sigma_path, sigma_baud = STATE.get_sigma()
+            port_candidates = [sigma_path, "/dev/sigma", "/dev/ttyACM0", "/dev/ttyUSB0"]
 
+            last_err = ""
+            for port in port_candidates:
+                if not port or not os.path.exists(port):
+                    continue
+
+                try:
+                    with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
+                        r = sigma.purchase(
+                            amount_minor=amount_minor_int,
+                            currency_num=currency_num,
+                            reference=reference,
+                            first_wait=25.0,
+                            final_wait=180.0,
+                        )
+
+                    status = str(r.get("status") or "")
+                    stage = str(r.get("stage") or "")
+                    approved = bool(r.get("approved"))
+
+                    raw = r.get("raw") or {}
+                    if not isinstance(raw, dict):
+                        raw = {}
+
+                    payload = {
+                        "approved": approved,
+                        "status": status,
+                        "stage": stage,
+                        "raw": r.get("raw") or r,
+                        "receipt": raw.get("RECEIPT", ""),
+                        "txid": str(raw.get("TXID") or raw.get("RRN") or ""),
+                        "port": port,
+                    }
+
+                    if status and status != "0" and not approved:
+                        return _json_response(self, 409, {"ok": False, "error": "sigma_rejected", **payload})
+
+                    return _json_response(self, 200, {"ok": True, **payload})
+
+                except Exception as e:
+                    last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
+                    continue
+
+            return _json_response(self, 502, {"ok": False, "error": "sigma_failed", "detail": last_err})
+
+        finally:
             try:
-                with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
-                    r = sigma.purchase(
-                        amount_minor=amount_minor_int,
-                        currency_num=currency_num,
-                        reference=reference,
-                        first_wait=25.0,
-                        final_wait=180.0,
-                    )
-
-                status = str(r.get("status") or "")
-                stage = str(r.get("stage") or "")
-                approved = bool(r.get("approved"))
-
-                raw = r.get("raw") or {}
-                if not isinstance(raw, dict):
-                    raw = {}
-
-                payload = {
-                    "approved": approved,
-                    "status": status,
-                    "stage": stage,
-                    "raw": r.get("raw") or r,
-                    "receipt": raw.get("RECEIPT", ""),
-                    "txid": str(raw.get("TXID") or raw.get("RRN") or ""),
-                    "port": port,
-                }
-
-                if status and status != "0" and not approved:
-                    return _json_response(self, 409, {"ok": False, "error": "sigma_rejected", **payload})
-
-                return _json_response(self, 200, {"ok": True, **payload})
-
-            except Exception as e:
-                last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
-                continue
-
-        return _json_response(self, 502, {"ok": False, "error": "sigma_failed", "detail": last_err})
+                SIGMA_LOCK.release()
+            except Exception:
+                pass
 
     def _handle_vend(self) -> None:
         data = _read_json(self)
@@ -696,3 +776,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+```
