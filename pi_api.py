@@ -53,7 +53,7 @@ UI_HEARTBEAT_FILE = os.environ.get("MEADOW_UI_HEARTBEAT_FILE", "/tmp/meadow_ui_h
 WP_HEARTBEAT_FILE = os.environ.get("MEADOW_WP_HEARTBEAT_FILE", "/tmp/meadow_wp_heartbeat")
 
 KIOSK_URL_FILE = os.environ.get("MEADOW_KIOSK_URL_FILE", "/home/meadow/kiosk.url")
-STOP_FLAG = os.environ.get("MEADOW_KIOSK_STOP_FLAG", "/tmp/meadow_kiosk_stop")
+STOP_FLAG = os.environ.get("MEADOW_KIOSK_STOP_FLAG", "/run/meadow/kiosk_stop")
 
 # Direct kiosk control (no systemd)
 KIOSK_SCRIPT = os.environ.get("MEADOW_KIOSK_SCRIPT", "/home/meadow/kiosk-browser.sh")
