@@ -29,11 +29,27 @@ sudo pkill -f "/home/meadow/kiosk-browser.sh" 2>/dev/null || true
 sudo pkill -f "chromium.*--kiosk" 2>/dev/null || true
 sudo pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true
 
-echo "=== Deploy scripts/assets (optional but useful) ==="
+echo "=== Deploy scripts/assets ==="
 sudo mkdir -p /home/meadow/meadow-kiosk
 sudo cp -f "$SCRIPT_DIR/kiosk-browser.sh" /home/meadow/kiosk-browser.sh
-sudo cp -f "$SCRIPT_DIR/exit-kiosk.sh" /home/meadow/exit-kiosk.sh
 sudo cp -f "$SCRIPT_DIR/offline.html" /home/meadow/offline.html
+
+# exit-kiosk.sh (overwrite with updated version)
+cat <<'EOF' | sudo tee /home/meadow/exit-kiosk.sh >/dev/null
+#!/bin/bash
+set -euo pipefail
+
+STOP_FLAG="/tmp/meadow_kiosk_stop"
+
+touch "$STOP_FLAG" 2>/dev/null || true
+systemctl --user stop meadow-kiosk-ui.service 2>/dev/null || true
+
+pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true
+pkill -f "chromium.*--kiosk" 2>/dev/null || true
+
+exit 0
+EOF
+
 sudo chmod +x /home/meadow/kiosk-browser.sh /home/meadow/exit-kiosk.sh
 sudo chmod 644 /home/meadow/offline.html || true
 sudo chown meadow:meadow /home/meadow/kiosk-browser.sh /home/meadow/exit-kiosk.sh /home/meadow/offline.html || true
@@ -49,57 +65,55 @@ cat <<'EOF' | sudo tee /home/meadow/.xbindkeysrc >/dev/null
 EOF
 sudo chown meadow:meadow /home/meadow/.xbindkeysrc
 
-echo "=== Desktop icon (Enter kiosk ONLY) ==="
-sudo mkdir -p /home/meadow/Desktop
+echo "=== Install systemd service (Pi API) ==="
+sudo install -m 644 "$SCRIPT_DIR/systemd/meadow-kiosk.service" /etc/systemd/system/meadow-kiosk.service
+sudo systemctl daemon-reload
+sudo systemctl enable meadow-kiosk.service
+sudo systemctl restart meadow-kiosk.service
 
-# If you keep a desktop file in repo, copy it, otherwise generate it.
-if [ -f "$SCRIPT_DIR/desktop/enter-kiosk.desktop" ]; then
-  sudo cp -f "$SCRIPT_DIR/desktop/enter-kiosk.desktop" /home/meadow/Desktop/Enter\ Meadow\ Kiosk.desktop
-else
-  cat <<'EOF' | sudo tee /home/meadow/Desktop/Enter\ Meadow\ Kiosk.desktop >/dev/null
+echo "=== Install user systemd service (Kiosk UI) ==="
+sudo -u meadow mkdir -p /home/meadow/.config/systemd/user
+cat <<'EOF' | sudo -u meadow tee /home/meadow/.config/systemd/user/meadow-kiosk-ui.service >/dev/null
+[Unit]
+Description=Meadow Kiosk UI (Chromium watchdog)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /home/meadow/kiosk-browser.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+
+echo "=== Enable lingering for meadow (allow user services at boot) ==="
+sudo loginctl enable-linger meadow
+
+echo "=== Enable user kiosk-ui service ==="
+sudo -u meadow systemctl --user daemon-reload
+sudo -u meadow systemctl --user enable meadow-kiosk-ui.service || true
+
+echo "=== Desktop + menu launcher (Enter kiosk) ==="
+sudo mkdir -p /home/meadow/Desktop
+cat <<'EOF' | sudo tee "/home/meadow/Desktop/Enter Meadow Kiosk.desktop" >/dev/null
 [Desktop Entry]
 Type=Application
 Name=Enter Meadow Kiosk
-Comment=Launch Meadow kiosk mode (fullscreen)
-Exec=bash -lc 'sudo systemctl restart meadow-kiosk.service'
+Comment=Start Meadow kiosk UI (Chromium)
+Exec=bash -lc 'systemctl --user restart meadow-kiosk-ui.service'
 Icon=video-display
 Terminal=false
 Categories=Utility;
 EOF
-fi
-
-# Ensure correct Exec line (just in case repo file differs)
-sudo sed -i "s/meadow-kiosk-browser\.service/meadow-kiosk.service/g" /home/meadow/Desktop/Enter\ Meadow\ Kiosk.desktop
-
-# Make launcher runnable + owned by meadow
-sudo chmod +x /home/meadow/Desktop/Enter\ Meadow\ Kiosk.desktop
+sudo chmod +x "/home/meadow/Desktop/Enter Meadow Kiosk.desktop"
 sudo chown -R meadow:meadow /home/meadow/Desktop
 
-# Optional: also install into application menu
-sudo mkdir -p /home/meadow/.local/share/applications
-sudo cp -f /home/meadow/Desktop/Enter\ Meadow\ Kiosk.desktop /home/meadow/.local/share/applications/Enter\ Meadow\ Kiosk.desktop
-sudo chown -R meadow:meadow /home/meadow/.local/share/applications
+sudo -u meadow mkdir -p /home/meadow/.local/share/applications
+sudo -u meadow cp -f "/home/meadow/Desktop/Enter Meadow Kiosk.desktop" "/home/meadow/.local/share/applications/Enter Meadow Kiosk.desktop"
 
-echo "=== Install update helper (optional) ==="
-sudo cp -f "$SCRIPT_DIR/update-meadow.sh" /home/meadow/update-meadow.sh
-sudo chmod +x /home/meadow/update-meadow.sh
-sudo chown meadow:meadow /home/meadow/update-meadow.sh
-
-echo "=== Install ONLY meadow-kiosk.service ==="
-sudo install -m 644 "$SCRIPT_DIR/systemd/meadow-kiosk.service" /etc/systemd/system/meadow-kiosk.service
-
-echo "=== Reload systemd ==="
-sudo systemctl daemon-reload
-
-echo "=== Sudoers for kiosk control (restart/stop/start + reboot/shutdown) ==="
-cat <<'EOF' | sudo tee /etc/sudoers.d/meadow-kiosk-control >/dev/null
-meadow ALL=(root) NOPASSWD: /bin/systemctl start meadow-kiosk.service, /bin/systemctl stop meadow-kiosk.service, /bin/systemctl restart meadow-kiosk.service, /sbin/reboot, /sbin/shutdown
-EOF
-sudo chmod 440 /etc/sudoers.d/meadow-kiosk-control
-
-echo "=== Enable + start meadow-kiosk.service ==="
-sudo systemctl enable meadow-kiosk.service
-sudo systemctl restart meadow-kiosk.service
-
-echo "=== Install complete. Reboot recommended. ==="
-echo "If the icon appears but won’t launch: right-click it and choose 'Allow Launching'."
+echo "=== Install complete ==="
+echo "Wayland note: launch via menu or: gtk-launch 'Enter Meadow Kiosk'"
+echo "To start kiosk now: sudo -u meadow systemctl --user restart meadow-kiosk-ui.service"
