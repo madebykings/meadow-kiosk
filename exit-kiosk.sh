@@ -1,16 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-STOP_FLAG="/tmp/meadow_kiosk_stop"
+# Set stop flags so kiosk-browser.sh won’t relaunch
+mkdir -p /run/meadow 2>/dev/null || true
+touch /run/meadow/kiosk_stop 2>/dev/null || true
+touch /tmp/meadow_kiosk_stop 2>/dev/null || true
 
-# Ask kiosk loop to stop
-touch "$STOP_FLAG" 2>/dev/null || true
-
-# Stop the UI user service (Wayland-friendly)
-systemctl --user stop meadow-kiosk-ui.service 2>/dev/null || true
-
-# Kill any leftover chromium kiosk instances
-pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true
-pkill -f "chromium.*--kiosk" 2>/dev/null || true
+# Kill chromium + kiosk loop
+pkill -f "kiosk-browser\.sh" 2>/dev/null || true
+pkill -f "chromium.*--kiosk|chromium-browser.*--kiosk" 2>/dev/null || true
 
 exit 0
