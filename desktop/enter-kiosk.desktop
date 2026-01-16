@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Enter Meadow Kiosk
-Comment=Launch Meadow kiosk mode (fullscreen)
-Exec=bash -lc 'sudo systemctl restart meadow-kiosk.service'
-Icon=video-display
-Terminal=false
-Categories=Utility;
