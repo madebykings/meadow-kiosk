@@ -484,54 +484,61 @@ def _config_poll_loop() -> None:
 # Local control actions (files + direct script launch)
 # -------------------------------------------------------------------
 
+def _user_systemctl(args: list[str]) -> Tuple[bool, str]:
+    """
+    Call systemctl --user for meadow user, talking to the meadow user bus.
+    This avoids inheriting NoNewPrivileges into the Chromium process.
+    """
+    try:
+        cmd = [
+            "sudo", "-u", "meadow",
+            "env",
+            "XDG_RUNTIME_DIR=/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus",
+            "systemctl", "--user",
+            *args
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        return True, out.strip()
+    except subprocess.CalledProcessError as e:
+        return False, (e.output or str(e)).strip()
+    except Exception as e:
+        return False, str(e)
+
+
 def _enter_kiosk() -> Tuple[bool, str]:
     try:
-        for p in (STOP_FLAG, KIOSK_PIDFILE):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
+        # Remove stop flag so UI service is allowed to run
+        try:
+            if os.path.exists(STOP_FLAG):
+                os.remove(STOP_FLAG)
+        except Exception:
+            pass
 
-        if _kiosk_running():
-            return True, "already_running"
-
-        if not os.path.exists(KIOSK_SCRIPT):
-            return False, f"missing_script:{KIOSK_SCRIPT}"
-
-        p = subprocess.Popen(["bash", KIOSK_SCRIPT], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _write_pidfile(p.pid)
-        return True, ""
+        ok, out = _user_systemctl(["start", "meadow-kiosk-ui.service"])
+        if not ok:
+            return False, out
+        return True, out or ""
     except Exception as e:
         return False, str(e)
 
 
 def _exit_kiosk() -> Tuple[bool, str]:
     try:
+        # Create stop flag for kiosk-browser.sh
         try:
+            os.makedirs(os.path.dirname(STOP_FLAG), exist_ok=True)
             with open(STOP_FLAG, "w", encoding="utf-8") as f:
                 f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
         except Exception:
             pass
 
-        subprocess.call(["pkill", "-f", "kiosk-browser.sh"])
-
-        pid = _read_pidfile()
-        if _pid_is_running(pid):
-            try:
-                os.kill(pid, 15)
-            except Exception:
-                pass
-
-        subprocess.call(["pkill", "-f", "chromium.*--kiosk"])
-        subprocess.call(["pkill", "-f", "chromium-browser.*--kiosk"])
-        subprocess.call(["pkill", "-f", "chromium --kiosk"])
-        subprocess.call(["pkill", "-f", "chromium-browser --kiosk"])
-
-        return True, ""
+        ok, out = _user_systemctl(["stop", "meadow-kiosk-ui.service"])
+        if not ok:
+            return False, out
+        return True, out or ""
     except Exception as e:
         return False, str(e)
-
 
 def _reload_kiosk() -> Tuple[bool, str]:
     ok, err = _exit_kiosk()
