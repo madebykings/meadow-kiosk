@@ -2,20 +2,15 @@
 set -euo pipefail
 
 STOP_FLAG="/tmp/meadow_kiosk_stop"
-LAUNCHER_UNIT="meadow-launcher.service"
-KIOSK_UNIT="meadow-kiosk-browser.service"
 
-# Tell kiosk loop to stop (script may check this)
+# Ask kiosk loop to stop
 touch "$STOP_FLAG" 2>/dev/null || true
 
-# Stop the systemd-managed kiosk loop (THIS is the key)
-sudo systemctl stop "$KIOSK_UNIT" || true
+# Stop the UI user service (Wayland-friendly)
+systemctl --user stop meadow-kiosk-ui.service 2>/dev/null || true
 
-# Kill any leftover chromium kiosk instances (belt + braces)
+# Kill any leftover chromium kiosk instances
 pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true
 pkill -f "chromium.*--kiosk" 2>/dev/null || true
-
-# Start the launcher service (desktop mode)
-sudo systemctl start "$LAUNCHER_UNIT" || true
 
 exit 0
