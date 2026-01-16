@@ -99,7 +99,7 @@ cat <<'EOF' | sudo tee "/home/meadow/Desktop/Enter Meadow Kiosk.desktop" >/dev/n
 Type=Application
 Name=Enter Meadow Kiosk
 Comment=Start Meadow kiosk UI (Chromium)
-Exec=bash -lc 'systemctl --user restart meadow-kiosk-ui.service'
+Exec=bash -lc 'rm -f /tmp/meadow_kiosk_stop; systemctl --user restart meadow-kiosk-ui.service'
 Icon=video-display
 Terminal=false
 Categories=Utility;
