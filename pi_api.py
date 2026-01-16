@@ -32,7 +32,7 @@ import time
 import threading
 import traceback
 import subprocess
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 
 import errno
@@ -874,7 +874,7 @@ def main() -> None:
     threading.Thread(target=_config_poll_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
-    httpd = HTTPServer((HOST, PORT), Handler)
+    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[pi_api] listening on http://{HOST}:{PORT}", flush=True)
     httpd.serve_forever()
 
