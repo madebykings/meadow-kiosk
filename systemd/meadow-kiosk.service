@@ -42,7 +42,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictRealtime=true
-RestrictNamespaces=true
+RestrictNamespaces=false
 UMask=007
 
 StandardOutput=journal
