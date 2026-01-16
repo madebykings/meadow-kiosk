@@ -775,8 +775,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             lock.release()
 
-    # -----------------------------
-    # Vend
+        # -----------------------------
+    # Vend (async / non-blocking)
     # -----------------------------
 
     def _handle_vend(self) -> None:
@@ -790,11 +790,24 @@ class Handler(BaseHTTPRequestHandler):
         if controller is None:
             return _json_response(self, 503, {"ok": False, "success": False, "error": "motors_not_loaded"})
 
-        try:
-            controller.vend(motor)
-            return _json_response(self, 200, {"ok": True, "success": True})
-        except Exception as e:
-            return _json_response(self, 500, {"ok": False, "success": False, "error": str(e)})
+        t0 = time.time()
+
+        def _do_vend() -> None:
+            try:
+                controller.vend(motor)
+            except Exception:
+                # Best-effort: vend failures should be handled upstream (WP vend-result / telemetry)
+                pass
+
+        threading.Thread(target=_do_vend, daemon=True).start()
+
+        return _json_response(self, 200, {
+            "ok": True,
+            "success": True,
+            "queued": True,
+            "motor": motor,
+            "t_ms": int((time.time() - t0) * 1000),
+        })
 
     def _handle_admin_vend_test(self) -> None:
         data = _read_json(self)
@@ -813,11 +826,22 @@ class Handler(BaseHTTPRequestHandler):
         if controller is None:
             return _json_response(self, 503, {"ok": False, "error": "motors_not_loaded"})
 
-        try:
-            controller.vend(motor)
-            return _json_response(self, 200, {"ok": True, "motor": motor})
-        except Exception as e:
-            return _json_response(self, 500, {"ok": False, "motor": motor, "error": str(e)})
+        t0 = time.time()
+
+        def _do_vend() -> None:
+            try:
+                controller.vend(motor)
+            except Exception:
+                pass
+
+        threading.Thread(target=_do_vend, daemon=True).start()
+
+        return _json_response(self, 200, {
+            "ok": True,
+            "motor": motor,
+            "queued": True,
+            "t_ms": int((time.time() - t0) * 1000),
+        })
 
     # -----------------------------
     # Admin control
