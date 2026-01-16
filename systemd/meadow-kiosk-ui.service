@@ -1,0 +1,13 @@
+[Unit]
+Description=Meadow Kiosk UI (Chromium watchdog)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /home/meadow/kiosk-browser.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
