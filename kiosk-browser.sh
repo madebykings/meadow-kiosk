@@ -143,11 +143,18 @@ while true; do
   # Clear previous chromium log header (optional)
   echo "----- $(date -Is 2>/dev/null || date) launching chromium url=$URL -----" >> "$CHROMIUM_LOG" 2>/dev/null || true
 
+  # --- Ensure we have a display session (Pi OS desktop) ---
+  export DISPLAY="${DISPLAY:-:0}"
+  export XAUTHORITY="${XAUTHORITY:-/home/meadow/.Xauthority}"
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
+
   # Chromium kiosk flags
   "$CHROME_BIN" \
     --kiosk \
     --noerrdialogs \
     --disable-infobars \
+    --no-sandbox \
+    --disable-setuid-sandbox \
     --disable-session-crashed-bubble \
     --disable-features=TranslateUI \
     --overscroll-history-navigation=0 \
