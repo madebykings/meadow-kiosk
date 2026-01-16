@@ -1,7 +1,0 @@
-#!/bin/sh
-# Meadow launcher - Labwc autostart
-# Labwc executes this on session start
-
-sleep 2
-
-python3 /home/meadow/kiosk-launcher.py >> /home/meadow/launcher.log 2>&1 &
