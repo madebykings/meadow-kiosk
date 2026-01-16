@@ -25,15 +25,13 @@ sudo mkdir -p /home/meadow
 sudo chown -R meadow:meadow /home/meadow
 
 echo "=== Stop any legacy Meadow units if present (safe no-op if missing) ==="
-for u in meadow-kiosk-browser meadow-launcher meadow-remote-control meadow-vend-poller; do
+for u in meadow-kiosk-browser; do
   sudo systemctl stop "${u}.service" 2>/dev/null || true
   sudo systemctl disable "${u}.service" 2>/dev/null || true
 done
 
 echo "=== Kill any stray kiosk processes (belt + braces) ==="
-sudo pkill -f "/home/meadow/kiosk-launcher.py" 2>/dev/null || true
 sudo pkill -f "/home/meadow/kiosk-browser.sh" 2>/dev/null || true
-sudo pkill -f "remote_control.py" 2>/dev/null || true
 sudo pkill -f "chromium.*--kiosk" 2>/dev/null || true
 sudo pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true
 
@@ -72,10 +70,7 @@ echo "=== Install ONLY meadow-kiosk.service ==="
 sudo install -m 644 "$SCRIPT_DIR/systemd/meadow-kiosk.service" /etc/systemd/system/meadow-kiosk.service
 
 echo "=== Remove legacy Meadow unit files from /etc/systemd/system if present ==="
-sudo rm -f /etc/systemd/system/meadow-remote-control.service || true
-sudo rm -f /etc/systemd/system/meadow-launcher.service || true
 sudo rm -f /etc/systemd/system/meadow-kiosk-browser.service || true
-sudo rm -f /etc/systemd/system/meadow-vend-poller.service || true
 
 echo "=== Reload systemd ==="
 sudo systemctl daemon-reload
