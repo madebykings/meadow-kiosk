@@ -79,7 +79,7 @@ SIGMA_WARM_MAX_WAIT_SECS = 8.0     # bounded ensure_idle
 SIGMA_BUSY_LOCK_TIMEOUT = 0.10     # if Sigma busy, warmup returns immediately
 
 # Purchases can wait a bit longer to serialize safely
-SIGMA_PURCHASE_LOCK_TIMEOUT = 10.0  # seconds to wait for lock before returning 503
+SIGMA_PURCHASE_LOCK_TIMEOUT = 10.0  # seconds to wait for lock before returning "busy"
 
 
 class _SigmaGlobalLock:
@@ -109,7 +109,6 @@ class _SigmaGlobalLock:
 
         # 2) File lock (non-busy loop until timeout)
         try:
-            # Ensure file exists, keep fd open while locked
             fd = os.open(self.lockfile, os.O_CREAT | os.O_RDWR, 0o666)
             self._fd = fd
 
@@ -120,7 +119,7 @@ class _SigmaGlobalLock:
                     return False
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    # Stamp some debug info (best-effort)
+                    # Stamp debug info (best-effort)
                     try:
                         os.ftruncate(fd, 0)
                         os.lseek(fd, 0, os.SEEK_SET)
@@ -130,7 +129,6 @@ class _SigmaGlobalLock:
                     return True
                 except OSError as e:
                     if e.errno not in (errno.EACCES, errno.EAGAIN):
-                        # Unexpected lock error -> treat as failure
                         self.release()
                         return False
                     time.sleep(0.05)
@@ -171,15 +169,29 @@ class _SigmaGlobalLock:
 # Helpers
 # -------------------------------------------------------------------
 
+def _cors_origin(handler: BaseHTTPRequestHandler) -> str:
+    # Strict (lock down) if you want:
+    # return "https://meadowvending.com"
+    # Flexible: echo Origin if present, else "*"
+    return handler.headers.get("Origin") or "*"
+
+
+def _send_cors(handler: BaseHTTPRequestHandler) -> None:
+    origin = _cors_origin(handler)
+    handler.send_header("Access-Control-Allow-Origin", origin)
+    handler.send_header("Vary", "Origin")
+    handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key, X-Meadow-Key")
+    handler.send_header("Access-Control-Max-Age", "86400")
+
+
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
         handler.send_response(code)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Access-Control-Allow-Origin", "*")
-        handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+        _send_cors(handler)
         handler.end_headers()
         handler.wfile.write(body)
     except (BrokenPipeError, ConnectionResetError):
@@ -231,15 +243,10 @@ def _write_pidfile(pid: int) -> None:
         with open(KIOSK_PIDFILE, "w", encoding="utf-8") as f:
             f.write(str(int(pid)) + "\n")
     except Exception:
-        # intentionally swallow (pidfile is best-effort only)
         pass
 
 
 def _proc_running(pattern: str) -> bool:
-    """
-    Return True if any process matches the pattern.
-    Uses pgrep -fa (pattern is a regex for pgrep).
-    """
     try:
         rc = subprocess.call(
             ["pgrep", "-fa", pattern],
@@ -252,19 +259,10 @@ def _proc_running(pattern: str) -> bool:
 
 
 def _kiosk_running() -> bool:
-    """
-    Prefer real-world signals over PID file:
-      - kiosk-browser.sh running OR
-      - chromium in kiosk mode running
-
-    PID file remains best-effort only.
-    """
     if _proc_running(r"kiosk-browser\.sh"):
         return True
     if _proc_running(r"chromium.*--kiosk") or _proc_running(r"chromium-browser.*--kiosk"):
         return True
-
-    # fallback: pidfile (best-effort)
     return _pid_is_running(_read_pidfile())
 
 
@@ -488,7 +486,6 @@ def _config_poll_loop() -> None:
 
 def _enter_kiosk() -> Tuple[bool, str]:
     try:
-        # allow kiosk watchdog loop to run: remove stop flag + clear stale pidfile
         for p in (STOP_FLAG, KIOSK_PIDFILE):
             try:
                 if os.path.exists(p):
@@ -503,7 +500,7 @@ def _enter_kiosk() -> Tuple[bool, str]:
             return False, f"missing_script:{KIOSK_SCRIPT}"
 
         p = subprocess.Popen(["bash", KIOSK_SCRIPT], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _write_pidfile(p.pid)  # best-effort only
+        _write_pidfile(p.pid)
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -511,25 +508,21 @@ def _enter_kiosk() -> Tuple[bool, str]:
 
 def _exit_kiosk() -> Tuple[bool, str]:
     try:
-        # stop watchdog + create stop flag
         try:
             with open(STOP_FLAG, "w", encoding="utf-8") as f:
                 f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
         except Exception:
             pass
 
-        # Stop kiosk-browser loop directly (pidfile is not reliable on this image)
         subprocess.call(["pkill", "-f", "kiosk-browser.sh"])
 
-        # Best-effort stop: kill by pidfile too (if present)
         pid = _read_pidfile()
         if _pid_is_running(pid):
             try:
-                os.kill(pid, 15)  # SIGTERM
+                os.kill(pid, 15)
             except Exception:
                 pass
 
-        # Ensure kiosk chromium is gone
         subprocess.call(["pkill", "-f", "chromium.*--kiosk"])
         subprocess.call(["pkill", "-f", "chromium-browser.*--kiosk"])
         subprocess.call(["pkill", "-f", "chromium --kiosk"])
@@ -592,9 +585,7 @@ def _shutdown() -> Tuple[bool, str]:
 class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        _send_cors(self)
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -644,19 +635,22 @@ class Handler(BaseHTTPRequestHandler):
 
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
+    # -----------------------------
+    # Sigma
+    # -----------------------------
+
     def _handle_sigma_warm(self) -> None:
         """
-        Warm Sigma on browse screen:
-        - If a purchase is running (or another warmup), do NOT interfere: return warm_skipped immediately.
-        - Otherwise run ensure_idle() (bounded), which performs STATUS=20 recovery if needed:
-            COMPLETE_TX -> CANCEL_TX -> wait for GET_STATUS(TIMEOUT=0) to show STATUS=0
+        Best-effort warm:
+        - If Sigma is busy (purchase or warm already running), return warm_skipped immediately.
+        - Otherwise run ensure_idle() (bounded), which performs STATUS=20 recovery if needed.
         """
-        _ = _read_json(self)  # optional body, ignored
+        _ = _read_json(self)
+
         sigma_path, sigma_baud = STATE.get_sigma()
         port_candidates = [sigma_path, "/dev/sigma", "/dev/ttyACM0", "/dev/ttyUSB0"]
 
         t0 = time.time()
-
         lock = _SigmaGlobalLock(SIGMA_LOCKFILE)
         if not lock.acquire(timeout=SIGMA_BUSY_LOCK_TIMEOUT):
             return _json_response(self, 200, {
@@ -682,7 +676,6 @@ class Handler(BaseHTTPRequestHandler):
                         "port": port,
                         "t_ms": int((time.time() - t0) * 1000),
                     })
-
                 except Exception as e:
                     last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
                     continue
@@ -693,91 +686,98 @@ class Handler(BaseHTTPRequestHandler):
                 "detail": last_err,
                 "t_ms": int((time.time() - t0) * 1000),
             })
-
         finally:
             lock.release()
 
     def _handle_sigma_purchase(self) -> None:
-    data = _read_json(self)
-    amount_minor = data.get("amount_minor")
-    currency_num = str(data.get("currency_num") or "826")
-    reference = str(data.get("reference") or "")[:64]
+        data = _read_json(self)
+        amount_minor = data.get("amount_minor")
+        currency_num = str(data.get("currency_num") or "826")
+        reference = str(data.get("reference") or "")[:64]
 
-    try:
-        amount_minor_int = int(amount_minor)
-        if amount_minor_int <= 0:
-            raise ValueError("amount_minor must be > 0")
-    except Exception:
-        return _json_response(self, 400, {"ok": False, "error": "bad_amount"})
+        try:
+            amount_minor_int = int(amount_minor)
+            if amount_minor_int <= 0:
+                raise ValueError("amount_minor must be > 0")
+        except Exception:
+            return _json_response(self, 400, {"ok": False, "error": "bad_amount"})
 
-    # Guard: never allow purchase overlap
-    t0 = time.time()
-    lock = _SigmaGlobalLock(SIGMA_LOCKFILE)
-    if not lock.acquire(timeout=SIGMA_PURCHASE_LOCK_TIMEOUT):
-        # 423 = Locked (better semantic than 503). JS can retry.
-        return _json_response(self, 423, {
-            "ok": False,
-            "error": "sigma_busy_try_again",
-            "retry_ms": 900,
-            "t_ms": int((time.time() - t0) * 1000),
-        })
+        t0 = time.time()
+        lock = _SigmaGlobalLock(SIGMA_LOCKFILE)
+        if not lock.acquire(timeout=SIGMA_PURCHASE_LOCK_TIMEOUT):
+            # 423 Locked makes it clearer to the JS that this is a retry-able lock issue.
+            return _json_response(self, 423, {
+                "ok": False,
+                "error": "sigma_busy_try_again",
+                "retry_ms": 900,
+                "t_ms": int((time.time() - t0) * 1000),
+            })
 
-    try:
-        sigma_path, sigma_baud = STATE.get_sigma()
-        port_candidates = [sigma_path, "/dev/sigma", "/dev/ttyACM0", "/dev/ttyUSB0"]
+        try:
+            sigma_path, sigma_baud = STATE.get_sigma()
+            port_candidates = [sigma_path, "/dev/sigma", "/dev/ttyACM0", "/dev/ttyUSB0"]
 
-        last_err = ""
-        for port in port_candidates:
-            if not port or not os.path.exists(port):
-                continue
+            last_err = ""
+            for port in port_candidates:
+                if not port or not os.path.exists(port):
+                    continue
 
-            try:
-                with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
-                    # purchase() internally:
-                    #  - pre: ensure_idle() (STATUS=20 recovery)
-                    #  - purchase: wait until final frame
-                    #  - post: ensure_idle() best-effort to prevent "old tx" on next purchase
-                    r = sigma.purchase(
-                        amount_minor=amount_minor_int,
-                        currency_num=currency_num,
-                        reference=reference,
-                        first_wait=25.0,
-                        final_wait=180.0,
-                    )
+                try:
+                    with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
+                        # purchase() already does:
+                        #  - ensure_idle() (including STATUS=20 recovery)
+                        #  - wait until final frame
+                        r = sigma.purchase(
+                            amount_minor=amount_minor_int,
+                            currency_num=currency_num,
+                            reference=reference,
+                            first_wait=25.0,
+                            final_wait=180.0,
+                        )
 
-                status = str(r.get("status") or "")
-                stage = str(r.get("stage") or "")
-                approved = bool(r.get("approved"))
+                        # Extra safety: immediately try to return terminal to idle for next customer.
+                        # (If it’s already idle, this is quick.)
+                        try:
+                            sigma.ensure_idle(max_total_wait=10.0)
+                        except Exception:
+                            pass
 
-                raw = r.get("raw") or {}
-                if not isinstance(raw, dict):
-                    raw = {}
+                    status = str(r.get("status") or "")
+                    stage = str(r.get("stage") or "")
+                    approved = bool(r.get("approved"))
 
-                payload = {
-                    "approved": approved,
-                    "status": status,
-                    "stage": stage,
-                    "raw": raw,
-                    "receipt": raw.get("RECEIPT", ""),
-                    "txid": str(raw.get("TXID") or raw.get("RRN") or ""),
-                    "port": port,
-                    "t_ms": int((time.time() - t0) * 1000),
-                }
+                    raw = r.get("raw") or {}
+                    if not isinstance(raw, dict):
+                        raw = {}
 
-                # Non-zero STATUS = rejected/declined/error
-                if status and status != "0" and not approved:
-                    return _json_response(self, 409, {"ok": False, "error": "sigma_rejected", **payload})
+                    payload = {
+                        "approved": approved,
+                        "status": status,
+                        "stage": stage,
+                        "raw": raw,
+                        "receipt": raw.get("RECEIPT", ""),
+                        "txid": str(raw.get("TXID") or raw.get("RRN") or ""),
+                        "port": port,
+                        "t_ms": int((time.time() - t0) * 1000),
+                    }
 
-                return _json_response(self, 200, {"ok": True, **payload})
+                    if status and status != "0" and not approved:
+                        return _json_response(self, 409, {"ok": False, "error": "sigma_rejected", **payload})
 
-            except Exception as e:
-                last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
-                continue
+                    return _json_response(self, 200, {"ok": True, **payload})
 
-        return _json_response(self, 502, {"ok": False, "error": "sigma_failed", "detail": last_err})
+                except Exception as e:
+                    last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
+                    continue
 
-    finally:
-        lock.release()
+            return _json_response(self, 502, {"ok": False, "error": "sigma_failed", "detail": last_err})
+
+        finally:
+            lock.release()
+
+    # -----------------------------
+    # Vend
+    # -----------------------------
 
     def _handle_vend(self) -> None:
         data = _read_json(self)
@@ -819,23 +819,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return _json_response(self, 500, {"ok": False, "motor": motor, "error": str(e)})
 
+    # -----------------------------
+    # Admin control
+    # -----------------------------
+
     def _handle_admin_control(self) -> None:
-        """
-        Control actions you can trigger from WP button(s) via Cloudflare tunnel.
-
-        POST /admin/control
-          { kiosk_id, key, action, payload? }
-
-        actions:
-          - enter_kiosk
-          - exit_kiosk
-          - reload_kiosk
-          - set_url        payload:{url}
-          - set_url_reload payload:{url}
-          - update_code    payload:{branch}
-          - reboot
-          - shutdown
-        """
         data = _read_json(self)
         ok, err = _auth_admin(data)
         if not ok:
