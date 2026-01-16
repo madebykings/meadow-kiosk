@@ -18,9 +18,13 @@ OFFLINE_URL="file:///home/meadow/offline.html"
 # -------------------------------------------------------------------
 # Shared runtime paths (MUST be env-driven to avoid systemd PrivateTmp issues)
 # -------------------------------------------------------------------
+# Shared runtime paths (env-driven; avoids systemd PrivateTmp issues)
 STOP_FLAG="${MEADOW_KIOSK_STOP_FLAG:-/tmp/meadow_kiosk_stop}"
+
+# Heartbeats (env-driven)
 UI_HEARTBEAT_FILE="${MEADOW_UI_HEARTBEAT_FILE:-/tmp/meadow_ui_heartbeat}"
 WP_HEARTBEAT_FILE="${MEADOW_WP_HEARTBEAT_FILE:-/tmp/meadow_wp_heartbeat}"
+
 KIOSK_PIDFILE="${MEADOW_KIOSK_PIDFILE:-/tmp/meadow_kiosk_browser.pid}"
 RESTART_LOG="${MEADOW_RESTART_LOG:-/tmp/meadow_kiosk_restart_times}"
 
@@ -154,7 +158,7 @@ while true; do
     --disable-gpu \
     --disable-software-rasterizer \
     --disable-dev-shm-usage \
-    "$URL" >> "$CHROMIUM_LOG" 2>&1 &
+    "$URL" >> /home/meadow/state/chromium.log 2>&1 &
 
   CHROME_PID=$!
   echo "$CHROME_PID" > "$KIOSK_PIDFILE" 2>/dev/null || true
