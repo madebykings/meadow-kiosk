@@ -12,7 +12,6 @@ echo "---- $(date -Is) UPDATE START (branch=$BRANCH) ----"
 touch /tmp/meadow_kiosk_stop || true
 
 # Stop services (ignore failures)
-sudo systemctl stop meadow-remote-control || true
 sudo systemctl stop meadow-kiosk || true
 
 cd "$REPO_DIR"
@@ -30,7 +29,6 @@ fi
 # Restart services
 sudo systemctl daemon-reload || true
 sudo systemctl start meadow-kiosk
-sudo systemctl start meadow-remote-control
 
 # Allow kiosk to run again
 rm -f /tmp/meadow_kiosk_stop || true
