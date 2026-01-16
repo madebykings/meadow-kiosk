@@ -129,6 +129,7 @@ while true; do
   touch "$WP_HEARTBEAT_FILE" 2>/dev/null || true
 
   # Chromium kiosk flags
+    # Chromium kiosk flags
   "$CHROME_BIN" \
     --kiosk \
     --noerrdialogs \
@@ -140,7 +141,11 @@ while true; do
     --allow-running-insecure-content \
     --unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:8765 \
     --disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights \
+    --disable-gpu \
+    --disable-software-rasterizer \
+    --disable-dev-shm-usage \
     "$URL" &
+    
   CHROME_PID=$!
   START_TS=$(date +%s)
 
