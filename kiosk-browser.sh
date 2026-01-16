@@ -15,13 +15,20 @@ URL_FILE="/home/meadow/kiosk.url"
 DEFAULT_URL="about:blank"
 OFFLINE_URL="file:///home/meadow/offline.html"
 
-STOP_FLAG="/tmp/meadow_kiosk_stop"
+# -------------------------------------------------------------------
+# Shared runtime paths (MUST be env-driven to avoid systemd PrivateTmp issues)
+# -------------------------------------------------------------------
+STOP_FLAG="${MEADOW_KIOSK_STOP_FLAG:-/tmp/meadow_kiosk_stop}"
+UI_HEARTBEAT_FILE="${MEADOW_UI_HEARTBEAT_FILE:-/tmp/meadow_ui_heartbeat}"
+WP_HEARTBEAT_FILE="${MEADOW_WP_HEARTBEAT_FILE:-/tmp/meadow_wp_heartbeat}"
+KIOSK_PIDFILE="${MEADOW_KIOSK_PIDFILE:-/tmp/meadow_kiosk_browser.pid}"
+RESTART_LOG="${MEADOW_RESTART_LOG:-/tmp/meadow_kiosk_restart_times}"
 
-# Heartbeats
-UI_HEARTBEAT_FILE="/tmp/meadow_ui_heartbeat"
-WP_HEARTBEAT_FILE="/tmp/meadow_wp_heartbeat"
+log "[Meadow] Using STOP_FLAG=$STOP_FLAG"
 log "[Meadow] Using UI_HEARTBEAT_FILE=$UI_HEARTBEAT_FILE"
 log "[Meadow] Using WP_HEARTBEAT_FILE=$WP_HEARTBEAT_FILE"
+log "[Meadow] Using KIOSK_PIDFILE=$KIOSK_PIDFILE"
+log "[Meadow] Using RESTART_LOG=$RESTART_LOG"
 
 # Hung UI detection (Chromium wedged / JS stalled)
 UI_HEARTBEAT_MAX_AGE="${MEADOW_UI_HEARTBEAT_MAX_AGE:-45}"
@@ -40,10 +47,10 @@ MAX_RESTARTS_IN_WINDOW="${MEADOW_MAX_RESTARTS_IN_WINDOW:-10}"
 BACKOFF_START="${MEADOW_BACKOFF_START:-2}"
 BACKOFF_MAX="${MEADOW_BACKOFF_MAX:-60}"
 
-RESTART_LOG="/tmp/meadow_kiosk_restart_times"
-
 # Local daemon heartbeat endpoint (must return 200)
 DAEMON_HEARTBEAT_URL="${MEADOW_DAEMON_HEARTBEAT_URL:-http://127.0.0.1:8765/heartbeat}"
+
+CHROMIUM_LOG="/home/meadow/state/chromium.log"
 
 get_url() {
   if [ -f "$URL_FILE" ]; then
@@ -124,12 +131,15 @@ while true; do
     exit 1
   fi
 
-  # Ensure heartbeat file exists (prevents huge ages on first run)
+  # Ensure heartbeat files exist (prevents huge ages on first run)
+  mkdir -p "$(dirname "$UI_HEARTBEAT_FILE")" "$(dirname "$WP_HEARTBEAT_FILE")" "$(dirname "$RESTART_LOG")" "$(dirname "$KIOSK_PIDFILE")" 2>/dev/null || true
   touch "$UI_HEARTBEAT_FILE" 2>/dev/null || true
   touch "$WP_HEARTBEAT_FILE" 2>/dev/null || true
 
+  # Clear previous chromium log header (optional)
+  echo "----- $(date -Is 2>/dev/null || date) launching chromium url=$URL -----" >> "$CHROMIUM_LOG" 2>/dev/null || true
+
   # Chromium kiosk flags
-    # Chromium kiosk flags
   "$CHROME_BIN" \
     --kiosk \
     --noerrdialogs \
@@ -144,9 +154,10 @@ while true; do
     --disable-gpu \
     --disable-software-rasterizer \
     --disable-dev-shm-usage \
-    "$URL" >> /home/meadow/state/chromium.log 2>&1 &
-    
+    "$URL" >> "$CHROMIUM_LOG" 2>&1 &
+
   CHROME_PID=$!
+  echo "$CHROME_PID" > "$KIOSK_PIDFILE" 2>/dev/null || true
   START_TS=$(date +%s)
 
   # Watch loop while Chromium is running
