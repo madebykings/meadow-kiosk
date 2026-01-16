@@ -144,7 +144,7 @@ while true; do
     --disable-gpu \
     --disable-software-rasterizer \
     --disable-dev-shm-usage \
-    "$URL" &
+    "$URL" >> /home/meadow/state/chromium.log 2>&1 &
     
   CHROME_PID=$!
   START_TS=$(date +%s)
