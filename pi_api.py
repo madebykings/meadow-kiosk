@@ -123,10 +123,40 @@ def _write_pidfile(pid: int) -> None:
         with open(KIOSK_PIDFILE, "w", encoding="utf-8") as f:
             f.write(str(int(pid)) + "\n")
     except Exception:
+        # intentionally swallow (pidfile is best-effort only)
         pass
 
 
+def _proc_running(pattern: str) -> bool:
+    """
+    Return True if any process matches the pattern.
+    Uses pgrep -fa (pattern is a regex for pgrep).
+    """
+    try:
+        rc = subprocess.call(
+            ["pgrep", "-fa", pattern],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return rc == 0
+    except Exception:
+        return False
+
+
 def _kiosk_running() -> bool:
+    """
+    Prefer real-world signals over PID file:
+      - kiosk-browser.sh running OR
+      - chromium in kiosk mode running
+
+    PID file remains best-effort only.
+    """
+    if _proc_running(r"kiosk-browser\.sh"):
+        return True
+    if _proc_running(r"chromium.*--kiosk") or _proc_running(r"chromium-browser.*--kiosk"):
+        return True
+
+    # fallback: pidfile (best-effort)
     return _pid_is_running(_read_pidfile())
 
 
@@ -349,12 +379,13 @@ def _config_poll_loop() -> None:
 
 def _enter_kiosk() -> Tuple[bool, str]:
     try:
-        # allow kiosk watchdog loop to run
-        try:
-            if os.path.exists(STOP_FLAG):
-                os.remove(STOP_FLAG)
-        except Exception:
-            pass
+        # allow kiosk watchdog loop to run: remove stop flag + clear stale pidfile
+        for p in (STOP_FLAG, KIOSK_PIDFILE):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
         if _kiosk_running():
             return True, "already_running"
@@ -363,7 +394,7 @@ def _enter_kiosk() -> Tuple[bool, str]:
             return False, f"missing_script:{KIOSK_SCRIPT}"
 
         p = subprocess.Popen(["bash", KIOSK_SCRIPT], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _write_pidfile(p.pid)
+        _write_pidfile(p.pid)  # best-effort only
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -378,7 +409,10 @@ def _exit_kiosk() -> Tuple[bool, str]:
         except Exception:
             pass
 
-        # Best-effort stop: kill the script pid, plus chromium kiosk procs
+        # Stop kiosk-browser loop directly (pidfile is not reliable on this image)
+        subprocess.call(["pkill", "-f", "kiosk-browser.sh"])
+
+        # Best-effort stop: kill by pidfile too (if present)
         pid = _read_pidfile()
         if _pid_is_running(pid):
             try:
