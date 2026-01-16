@@ -31,7 +31,7 @@ StartLimitIntervalSec=60
 StartLimitBurst=10
 
 # Hardening (safe defaults for this app)
-NoNewPrivileges=false
+NoNewPrivileges=true
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -42,7 +42,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictRealtime=true
-RestrictNamespaces=false
+RestrictNamespaces=true
 UMask=007
 
 StandardOutput=journal
