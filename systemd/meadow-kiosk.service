@@ -6,13 +6,18 @@ Wants=network-online.target systemd-resolved.service
 [Service]
 Type=simple
 User=meadow
+
+RuntimeDirectory=meadow
+RuntimeDirectoryMode=0755
+
 WorkingDirectory=/home/meadow/meadow-kiosk
 Environment=PYTHONUNBUFFERED=1
 Environment=GIT_TERMINAL_PROMPT=0
-Environment=MEADOW_KIOSK_STOP_FLAG=/run/meadow_kiosk_stop
-Environment=MEADOW_UI_HEARTBEAT_FILE=/run/meadow_ui_heartbeat
-Environment=MEADOW_WP_HEARTBEAT_FILE=/run/meadow_wp_heartbeat
-Environment=MEADOW_KIOSK_PIDFILE=/run/meadow_kiosk_browser.pid
+
+Environment=MEADOW_KIOSK_STOP_FLAG=/run/meadow/kiosk_stop
+Environment=MEADOW_UI_HEARTBEAT_FILE=/run/meadow/ui_heartbeat
+Environment=MEADOW_WP_HEARTBEAT_FILE=/run/meadow/wp_heartbeat
+Environment=MEADOW_KIOSK_PIDFILE=/run/meadow/kiosk_browser.pid
 
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git fetch --prune origin'
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git reset --hard origin/main'
