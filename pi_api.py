@@ -486,28 +486,34 @@ def _config_poll_loop() -> None:
 
 def _enter_kiosk() -> Tuple[bool, str]:
     """
-    Enter kiosk mode by:
-      - removing STOP_FLAG (if present)
-      - starting kiosk-browser.sh directly (no systemd, no sudo)
-      - writing PIDFILE for basic tracking
+    Force enter kiosk mode (match enter-kiosk.sh behaviour):
+      - clear stop flags in BOTH locations
+      - kill any kiosk chromium + kiosk-browser loop
+      - launch kiosk-browser.sh detached
     """
     try:
-        # Clear stop flag + stale pidfile
-        for p in (STOP_FLAG, KIOSK_PIDFILE):
+        # Ensure run dir exists (kiosk-browser.sh writes pid/restart files there)
+        try:
+            os.makedirs("/run/meadow", exist_ok=True)
+        except Exception:
+            pass
+
+        # Clear stop flags + stale pidfile (both old and new locations)
+        for p in ("/run/meadow/kiosk_stop", "/tmp/meadow_kiosk_stop", STOP_FLAG, KIOSK_PIDFILE):
             try:
                 if os.path.exists(p):
                     os.remove(p)
             except Exception:
                 pass
 
-        # If already running, do nothing
-        if _kiosk_running():
-            return True, "already_running"
+        # Kill any previous kiosk processes (best-effort)
+        subprocess.call(["pkill", "-f", r"kiosk-browser\.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.call(["pkill", "-f", r"chromium.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.call(["pkill", "-f", r"chromium-browser.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         if not os.path.exists(KIOSK_SCRIPT):
             return False, f"missing_script:{KIOSK_SCRIPT}"
 
-        # Start kiosk browser script with a display/session environment
         env = os.environ.copy()
         env.setdefault("DISPLAY", ":0")
         env.setdefault("XAUTHORITY", "/home/meadow/.Xauthority")
@@ -519,11 +525,11 @@ def _enter_kiosk() -> Tuple[bool, str]:
             stderr=subprocess.DEVNULL,
             env=env,
         )
-
         _write_pidfile(p.pid)
         return True, ""
     except Exception as e:
         return False, str(e)
+
 
 
 
