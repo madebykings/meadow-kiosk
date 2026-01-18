@@ -7,8 +7,10 @@ Fast local endpoints (no WP latency):
   POST /vend                      { motor:int }
 
 Admin endpoints (require kiosk_id + key):
-  POST /admin/vend-test           { kiosk_id:int, key:str, motor:int }
-  POST /admin/control             { kiosk_id:int, key:str, action:str, payload?:object }
+  POST /admin/vend-test           { kiosk_id:int?, key:str?, motor:int }
+  POST /admin/control             { kiosk_id:int?, key:str?, action:str, payload?:object }
+  POST /admin/ping                { kiosk_id:int?, key:str? }
+  GET  /admin/status              (auth required)
 
 Health/debug:
   GET  /health
@@ -17,7 +19,12 @@ Health/debug:
 
 Notes:
   - Binds to 127.0.0.1 only. Cloudflare Tunnel publishes it externally.
-  - Admin endpoints REQUIRE kiosk_id + key (from cfg.api_key in WP config).
+  - Admin endpoints REQUIRE kiosk_id + key (from cfg.api_key in WP config)
+    BUT we also accept key/id from headers for WP admin buttons:
+      - key: X-Meadow-Key / X-Admin-Key / X-API-Key / Authorization: Bearer <key>
+      - kiosk_id: X-Kiosk-Id / X-Meadow-Kiosk-Id
+  - Optional fallback if WP config not loaded yet:
+      MEADOW_ADMIN_KEY, MEADOW_ADMIN_KIOSK_ID
   - Kiosk mode control uses STOP_FLAG + direct launch of kiosk-browser.sh (no systemd required).
   - Sigma calls are guarded by a single lock so warmup can never overlap purchase.
   - Locking is BOTH in-process (threading) and cross-process (fcntl flock) to prevent overlap even if
@@ -65,20 +72,21 @@ UPDATE_SCRIPT = os.environ.get("MEADOW_UPDATE_SCRIPT", "/home/meadow/meadow-kios
 CONFIG_POLL_SECS = int(os.environ.get("MEADOW_CONFIG_POLL_SECS", "30"))
 HEARTBEAT_SECS = int(os.environ.get("MEADOW_HEARTBEAT_SECS", "60"))
 
+# Admin fallback (useful before first config fetch)
+ADMIN_KEY_FALLBACK = (os.environ.get("MEADOW_ADMIN_KEY") or "").strip()
+try:
+    ADMIN_KIOSK_ID_FALLBACK = int(os.environ.get("MEADOW_ADMIN_KIOSK_ID") or "0")
+except Exception:
+    ADMIN_KIOSK_ID_FALLBACK = 0
+
 # -------------------------------------------------------------------
 # Sigma concurrency guard (warmup + purchase share one serial port)
 # -------------------------------------------------------------------
-# In-process lock (threads)
 _SIGMA_THREAD_LOCK = threading.Lock()
-
-# Cross-process lock (prevents overlap if pi_api is started twice)
 SIGMA_LOCKFILE = os.environ.get("MEADOW_SIGMA_LOCKFILE", "/tmp/meadow_sigma.lock")
 
-# Warmup should be fast + never block UI if Sigma is in-use
-SIGMA_WARM_MAX_WAIT_SECS = 8.0     # bounded ensure_idle
-SIGMA_BUSY_LOCK_TIMEOUT = 0.10     # if Sigma busy, warmup returns immediately
-
-# Purchases can wait a bit longer to serialize safely
+SIGMA_WARM_MAX_WAIT_SECS = 8.0      # bounded ensure_idle
+SIGMA_BUSY_LOCK_TIMEOUT = 0.10      # if Sigma busy, warmup returns immediately
 SIGMA_PURCHASE_LOCK_TIMEOUT = 10.0  # seconds to wait for lock before returning "busy"
 
 
@@ -138,7 +146,6 @@ class _SigmaGlobalLock:
             return False
 
     def release(self) -> None:
-        # Release file lock
         if self._fd is not None:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
@@ -150,7 +157,6 @@ class _SigmaGlobalLock:
                 pass
             self._fd = None
 
-        # Release thread lock
         if self._held_thread:
             try:
                 _SIGMA_THREAD_LOCK.release()
@@ -170,9 +176,6 @@ class _SigmaGlobalLock:
 # -------------------------------------------------------------------
 
 def _cors_origin(handler: BaseHTTPRequestHandler) -> str:
-    # Strict (lock down) if you want:
-    # return "https://meadowvending.com"
-    # Flexible: echo Origin if present, else "*"
     return handler.headers.get("Origin") or "*"
 
 
@@ -181,7 +184,11 @@ def _send_cors(handler: BaseHTTPRequestHandler) -> None:
     handler.send_header("Access-Control-Allow-Origin", origin)
     handler.send_header("Vary", "Origin")
     handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key, X-Meadow-Key")
+    # IMPORTANT: admin buttons often send auth via headers
+    handler.send_header(
+        "Access-Control-Allow-Headers",
+        "Content-Type, X-Admin-Key, X-Meadow-Key, X-API-Key, Authorization, X-Kiosk-Id, X-Meadow-Kiosk-Id",
+    )
     handler.send_header("Access-Control-Max-Age", "86400")
 
 
@@ -264,6 +271,21 @@ def _kiosk_running() -> bool:
     if _proc_running(r"chromium.*--kiosk") or _proc_running(r"chromium-browser.*--kiosk"):
         return True
     return _pid_is_running(_read_pidfile())
+
+
+def _header_first(handler: BaseHTTPRequestHandler, names: Tuple[str, ...]) -> str:
+    for n in names:
+        v = (handler.headers.get(n) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _extract_bearer(handler: BaseHTTPRequestHandler) -> str:
+    auth = (handler.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return ""
 
 
 # -------------------------------------------------------------------
@@ -378,6 +400,10 @@ class RuntimeState:
                     "stop_flag_exists": os.path.exists(STOP_FLAG),
                     "url_file": KIOSK_URL_FILE,
                 },
+                "admin_fallback": {
+                    "has_admin_key_fallback": bool(ADMIN_KEY_FALLBACK),
+                    "admin_kiosk_id_fallback": ADMIN_KIOSK_ID_FALLBACK,
+                },
             }
 
     def get_sigma(self) -> Tuple[str, int]:
@@ -400,13 +426,36 @@ STATE = RuntimeState()
 
 
 # -------------------------------------------------------------------
-# Admin auth
+# Admin auth (accept body OR headers; allow env fallback)
 # -------------------------------------------------------------------
 
-def _auth_admin(data: Dict[str, Any]) -> Tuple[bool, str]:
+def _auth_admin(handler: BaseHTTPRequestHandler, data: Dict[str, Any]) -> Tuple[bool, str]:
     want_kiosk_id, want_key, _domain = STATE.get_auth()
-    got_kiosk_id = int(data.get("kiosk_id") or 0)
+
+    # fallback if config not loaded yet
+    if (not want_kiosk_id) and ADMIN_KIOSK_ID_FALLBACK:
+        want_kiosk_id = ADMIN_KIOSK_ID_FALLBACK
+    if (not want_key) and ADMIN_KEY_FALLBACK:
+        want_key = ADMIN_KEY_FALLBACK
+
+    # kiosk id from body OR headers
+    got_kiosk_id = 0
+    try:
+        got_kiosk_id = int(data.get("kiosk_id") or 0)
+    except Exception:
+        got_kiosk_id = 0
+    if not got_kiosk_id:
+        try:
+            got_kiosk_id = int(_header_first(handler, ("X-Kiosk-Id", "X-Meadow-Kiosk-Id")) or "0")
+        except Exception:
+            got_kiosk_id = 0
+
+    # key from body OR headers
     got_key = (str(data.get("key") or "")).strip()
+    if not got_key:
+        got_key = _header_first(handler, ("X-Meadow-Key", "X-Admin-Key", "X-API-Key")).strip()
+    if not got_key:
+        got_key = _extract_bearer(handler).strip()
 
     if not want_kiosk_id or not want_key:
         return False, "pi_not_ready_no_auth"
@@ -494,14 +543,12 @@ def _enter_kiosk() -> Tuple[bool, str]:
         if not os.path.exists(script):
             return False, f"missing_script:{script}"
 
-        # IMPORTANT: when called from systemd (pi_api), provide the GUI env
         env = os.environ.copy()
         env.setdefault("DISPLAY", ":0")
         env.setdefault("XAUTHORITY", "/home/meadow/.Xauthority")
         env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
         env.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
 
-        # Run detached; don't block API call
         subprocess.Popen(
             ["bash", script],
             stdout=subprocess.DEVNULL,
@@ -509,39 +556,12 @@ def _enter_kiosk() -> Tuple[bool, str]:
             env=env,
         )
 
-        # Give it a moment, then confirm something actually started
         time.sleep(0.7)
         if _kiosk_running():
             return True, ""
         return False, "failed_to_start"
     except Exception as e:
         return False, str(e)
-
-        # Kill any previous kiosk processes (best-effort)
-        subprocess.call(["pkill", "-f", r"kiosk-browser\.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.call(["pkill", "-f", r"chromium.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.call(["pkill", "-f", r"chromium-browser.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        if not os.path.exists(KIOSK_SCRIPT):
-            return False, f"missing_script:{KIOSK_SCRIPT}"
-
-        env = os.environ.copy()
-        env.setdefault("DISPLAY", ":0")
-        env.setdefault("XAUTHORITY", "/home/meadow/.Xauthority")
-        env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
-
-        p = subprocess.Popen(
-            ["bash", KIOSK_SCRIPT],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-        )
-        _write_pidfile(p.pid)
-        return True, ""
-    except Exception as e:
-        return False, str(e)
-
-
 
 
 def _exit_kiosk() -> Tuple[bool, str]:
@@ -552,9 +572,7 @@ def _exit_kiosk() -> Tuple[bool, str]:
       - clearing PIDFILE
     """
     try:
-        # Create stop flag
         try:
-            # STOP_FLAG might be in /run/meadow/... in future; mkdir if needed
             d = os.path.dirname(STOP_FLAG)
             if d:
                 os.makedirs(d, exist_ok=True)
@@ -563,16 +581,13 @@ def _exit_kiosk() -> Tuple[bool, str]:
         except Exception:
             pass
 
-        # Kill the script loop (best-effort)
         subprocess.call(["pkill", "-f", r"kiosk-browser\.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Kill chromium kiosk (best-effort)
         subprocess.call(["pkill", "-f", r"chromium.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.call(["pkill", "-f", r"chromium-browser.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.call(["pkill", "-f", r"chromium --kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.call(["pkill", "-f", r"chromium-browser --kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # If we have a pidfile, try to terminate that PID too
         pid = _read_pidfile()
         if _pid_is_running(pid):
             try:
@@ -580,7 +595,6 @@ def _exit_kiosk() -> Tuple[bool, str]:
             except Exception:
                 pass
 
-        # Clear pidfile
         try:
             if os.path.exists(KIOSK_PIDFILE):
                 os.remove(KIOSK_PIDFILE)
@@ -651,7 +665,6 @@ def _kill_all() -> Tuple[bool, str]:
     and set STOP_FLAG so kiosk-browser.sh doesn't instantly relaunch.
     """
     try:
-        # stop flag (both locations, just in case)
         try:
             os.makedirs(os.path.dirname(STOP_FLAG), exist_ok=True)
             with open(STOP_FLAG, "w", encoding="utf-8") as f:
@@ -665,12 +678,10 @@ def _kill_all() -> Tuple[bool, str]:
         except Exception:
             pass
 
-        # kill the loop + chromium kiosk
         subprocess.call(["pkill", "-f", r"kiosk-browser\.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.call(["pkill", "-f", r"chromium.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.call(["pkill", "-f", r"chromium-browser.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # clear pidfile
         try:
             if os.path.exists(KIOSK_PIDFILE):
                 os.remove(KIOSK_PIDFILE)
@@ -680,8 +691,6 @@ def _kill_all() -> Tuple[bool, str]:
         return True, ""
     except Exception as e:
         return False, str(e)
-
-
 
 
 # -------------------------------------------------------------------
@@ -717,6 +726,26 @@ class Handler(BaseHTTPRequestHandler):
             _touch(UI_HEARTBEAT_FILE)
             return _json_response(self, 200, {"ok": True})
 
+        if self.path.startswith("/admin/status"):
+            data: Dict[str, Any] = {}
+            ok, err = _auth_admin(self, data)
+            if not ok:
+                return _json_response(self, 403, {"ok": False, "error": err})
+            snap = STATE.snapshot()
+            return _json_response(self, 200, {
+                "ok": True,
+                "kiosk_running": snap["kiosk"]["running"],
+                "stop_flag_exists": snap["kiosk"]["stop_flag_exists"],
+                "motors_loaded": snap["motors_loaded"],
+                "sigma_path": snap["sigma_path"],
+                "sigma_baud": snap["sigma_baud"],
+                "last_config_ok": snap["last_config_ok"],
+                "last_config_ts": snap["last_config_ts"],
+                "last_heartbeat_ok": snap["heartbeat"]["ok"],
+                "last_heartbeat_ts": snap["heartbeat"]["ts"],
+                "pi_git": _git_short_hash(),
+            })
+
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
@@ -739,18 +768,27 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/admin/control"):
             return self._handle_admin_control()
 
+        if self.path.startswith("/admin/ping"):
+            return self._handle_admin_ping()
+
         return _json_response(self, 404, {"ok": False, "error": "not_found"})
+
+    # -----------------------------
+    # Admin ping/status
+    # -----------------------------
+
+    def _handle_admin_ping(self) -> None:
+        data = _read_json(self)
+        ok, err = _auth_admin(self, data)
+        if not ok:
+            return _json_response(self, 403, {"ok": False, "error": err})
+        return _json_response(self, 200, {"ok": True, "auth": "ok", "pi_git": _git_short_hash()})
 
     # -----------------------------
     # Sigma
     # -----------------------------
 
     def _handle_sigma_warm(self) -> None:
-        """
-        Best-effort warm:
-        - If Sigma is busy (purchase or warm already running), return warm_skipped immediately.
-        - Otherwise run ensure_idle() (bounded), which performs STATUS=20 recovery if needed.
-        """
         _ = _read_json(self)
 
         sigma_path, sigma_baud = STATE.get_sigma()
@@ -811,7 +849,6 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         lock = _SigmaGlobalLock(SIGMA_LOCKFILE)
         if not lock.acquire(timeout=SIGMA_PURCHASE_LOCK_TIMEOUT):
-            # 423 Locked makes it clearer to the JS that this is a retry-able lock issue.
             return _json_response(self, 423, {
                 "ok": False,
                 "error": "sigma_busy_try_again",
@@ -830,9 +867,6 @@ class Handler(BaseHTTPRequestHandler):
 
                 try:
                     with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
-                        # purchase() already does:
-                        #  - ensure_idle() (including STATUS=20 recovery)
-                        #  - wait until final frame
                         r = sigma.purchase(
                             amount_minor=amount_minor_int,
                             currency_num=currency_num,
@@ -840,9 +874,6 @@ class Handler(BaseHTTPRequestHandler):
                             first_wait=25.0,
                             final_wait=180.0,
                         )
-
-                        # Extra safety: immediately try to return terminal to idle for next customer.
-                        # (If it’s already idle, this is quick.)
                         try:
                             sigma.ensure_idle(max_total_wait=10.0)
                         except Exception:
@@ -881,7 +912,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             lock.release()
 
-        # -----------------------------
+    # -----------------------------
     # Vend (async / non-blocking)
     # -----------------------------
 
@@ -902,7 +933,6 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 controller.vend(motor)
             except Exception:
-                # Best-effort: vend failures should be handled upstream (WP vend-result / telemetry)
                 pass
 
         threading.Thread(target=_do_vend, daemon=True).start()
@@ -917,7 +947,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_admin_vend_test(self) -> None:
         data = _read_json(self)
-        ok, err = _auth_admin(data)
+        ok, err = _auth_admin(self, data)
         if not ok:
             return _json_response(self, 403, {"ok": False, "error": err})
 
@@ -955,7 +985,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_admin_control(self) -> None:
         data = _read_json(self)
-        ok, err = _auth_admin(data)
+        ok, err = _auth_admin(self, data)
         if not ok:
             return _json_response(self, 403, {"ok": False, "error": err})
 
@@ -1006,4 +1036,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
- 
