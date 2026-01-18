@@ -5,18 +5,18 @@ set -euo pipefail
 # Meadow kiosk-browser.sh
 #
 # - Launches Chromium in kiosk mode and watches for:
-#     * STOP_FLAG (exit)
-#     * UI heartbeat staleness (restart Chromium)
-#     * WP heartbeat staleness (switch to offline.html)
+#   * STOP_FLAG (exit)
+#   * UI heartbeat staleness (restart Chromium)
+#   * WP heartbeat staleness (switch to offline.html)
 #
 # IMPORTANT PATH RULE:
-#   Prefer /run/meadow/* as primary. Fall back to /tmp/* only if /run file missing.
+# Prefer /run/meadow/* as primary. Fall back to /tmp/* only if /run file missing.
 # ------------------------------------------------------------
 
 LOG_FILE="/home/meadow/state/kiosk-browser.log"
 CHROMIUM_LOG="/home/meadow/state/chromium.log"
-URL_FILE="${MEADOW_KIOSK_URL_FILE:-/home/meadow/kiosk.url}"
 
+URL_FILE="${MEADOW_KIOSK_URL_FILE:-/home/meadow/kiosk.url}"
 DEFAULT_URL="${MEADOW_DEFAULT_URL:-about:blank}"
 OFFLINE_URL="${MEADOW_OFFLINE_URL:-file:///home/meadow/offline.html}"
 
@@ -27,7 +27,6 @@ STOP_FLAG_TMP="/tmp/meadow_kiosk_stop"
 # Heartbeats: prefer /run, fallback /tmp
 UI_HEARTBEAT_RUN="${MEADOW_UI_HEARTBEAT_FILE:-/run/meadow/ui_heartbeat}"
 WP_HEARTBEAT_RUN="${MEADOW_WP_HEARTBEAT_FILE:-/run/meadow/wp_heartbeat}"
-
 UI_HEARTBEAT_TMP="/tmp/meadow_ui_heartbeat"
 WP_HEARTBEAT_TMP="/tmp/meadow_wp_heartbeat"
 
@@ -43,15 +42,16 @@ WATCH_INTERVAL="${MEADOW_WATCH_INTERVAL:-5}"
 
 RESTART_WINDOW_SECS="${MEADOW_RESTART_WINDOW_SECS:-600}"
 MAX_RESTARTS_IN_WINDOW="${MEADOW_MAX_RESTARTS_IN_WINDOW:-10}"
-
 BACKOFF_START="${MEADOW_BACKOFF_START:-2}"
 BACKOFF_MAX="${MEADOW_BACKOFF_MAX:-60}"
 
 # Optional: bridge UI heartbeat by poking local daemon
 DAEMON_HEARTBEAT_URL="${MEADOW_DAEMON_HEARTBEAT_URL:-http://127.0.0.1:8765/heartbeat}"
 
-# ---- helpers ------------------------------------------------
+# Dedicated Chrome profile (helps stability / avoids V8 OOM & weird state)
+CHROME_PROFILE="${MEADOW_CHROME_PROFILE:-/home/meadow/state/chrome-profile}"
 
+# ---- helpers ------------------------------------------------
 log() {
   local msg="$1"
   local ts
@@ -61,11 +61,9 @@ log() {
   echo "${msg}" >&2
 }
 
-# Prefer /run file; fallback to /tmp file; return empty if neither exists
 _pick_primary_or_fallback() {
   local run_path="$1"
   local tmp_path="$2"
-
   if [ -f "$run_path" ]; then
     echo "$run_path"
   elif [ -f "$tmp_path" ]; then
@@ -108,12 +106,20 @@ _age_of_file() {
 
 get_url() {
   local url="$DEFAULT_URL"
+
   if [ -f "$URL_FILE" ]; then
     url="$(head -n 1 "$URL_FILE" | tr -d '\r\n' || true)"
   fi
+
   if [ -z "${url:-}" ]; then
     url="$DEFAULT_URL"
   fi
+
+  # Normalize common case to avoid 301 (kiosk1 -> kiosk1/)
+  if [[ "$url" == "https://meadowvending.com/kiosk1" ]]; then
+    url="https://meadowvending.com/kiosk1/"
+  fi
+
   echo "$url"
 }
 
@@ -138,7 +144,6 @@ restart_count() {
   wc -l < "$RESTART_LOG" 2>/dev/null | tr -d ' '
 }
 
-# Best-effort: if local daemon responds, keep UI heartbeat fresh
 bridge_ui_heartbeat() {
   if curl -sS -m 1 -o /dev/null -X POST "$DAEMON_HEARTBEAT_URL" 2>/dev/null; then
     _touch_best_effort "$UI_HEARTBEAT_RUN"
@@ -146,10 +151,10 @@ bridge_ui_heartbeat() {
   fi
 }
 
-# Find chromium binary
 find_chrome() {
   local bin
   bin="${MEADOW_CHROME_BIN:-}"
+
   if [ -n "$bin" ] && command -v "$bin" >/dev/null 2>&1; then
     echo "$bin"
     return
@@ -163,11 +168,17 @@ find_chrome() {
 }
 
 # ---- startup ------------------------------------------------
-
-# Small delay to let desktop session settle (X/Wayland)
 sleep 2
 
-mkdir -p "$(dirname "$STOP_FLAG_RUN")" "$(dirname "$UI_HEARTBEAT_RUN")" "$(dirname "$WP_HEARTBEAT_RUN")" "$(dirname "$KIOSK_PIDFILE")" "$(dirname "$RESTART_LOG")" 2>/dev/null || true
+mkdir -p \
+  "$(dirname "$STOP_FLAG_RUN")" \
+  "$(dirname "$UI_HEARTBEAT_RUN")" \
+  "$(dirname "$WP_HEARTBEAT_RUN")" \
+  "$(dirname "$KIOSK_PIDFILE")" \
+  "$(dirname "$RESTART_LOG")" \
+  "/home/meadow/state" \
+  "$CHROME_PROFILE" \
+  2>/dev/null || true
 
 log "[Meadow] Using STOP_FLAG_RUN=$STOP_FLAG_RUN (fallback $STOP_FLAG_TMP)"
 log "[Meadow] Using UI_HEARTBEAT_RUN=$UI_HEARTBEAT_RUN (fallback $UI_HEARTBEAT_TMP)"
@@ -195,7 +206,6 @@ _touch_best_effort "$WP_HEARTBEAT_TMP"
 BACKOFF="$BACKOFF_START"
 
 # ---- main loop ---------------------------------------------
-
 while true; do
   if _stop_flag_present; then
     log "[Meadow] STOP_FLAG present — exiting kiosk loop"
@@ -204,7 +214,6 @@ while true; do
 
   URL="$(get_url)"
 
-  # Choose which heartbeat files to TRUST (prefer /run; fallback /tmp)
   UI_HB_FILE="$(_pick_primary_or_fallback "$UI_HEARTBEAT_RUN" "$UI_HEARTBEAT_TMP")"
   WP_HB_FILE="$(_pick_primary_or_fallback "$WP_HEARTBEAT_RUN" "$WP_HEARTBEAT_TMP")"
 
@@ -216,7 +225,7 @@ while true; do
     fi
   fi
 
-  # Display env (best effort; harmless if already set)
+  # Display env (best effort)
   export DISPLAY="${DISPLAY:-:0}"
   export XAUTHORITY="${XAUTHORITY:-/home/meadow/.Xauthority}"
   export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
@@ -224,21 +233,27 @@ while true; do
   log "[Meadow] Launching chromium url=$URL"
   echo "----- $(date -Is 2>/dev/null || date) launching chromium url=$URL -----" >> "$CHROMIUM_LOG" 2>/dev/null || true
 
-  # Launch chromium
-"$CHROME_BIN" \
-  --no-sandbox \
-  --disable-dev-shm-usage \
-  --kiosk \
-  --noerrdialogs \
-  --disable-infobars \
-  --disable-session-crashed-bubble \
-  --disable-features=TranslateUI \
-  --overscroll-history-navigation=0 \
-  --autoplay-policy=no-user-gesture-required \
-  --allow-running-insecure-content \
-  --unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:8765 \
-  --disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights \
-  "$URL" >> "$CHROMIUM_LOG" 2>&1
+  # Launch chromium (MUST background to track PID)
+  "$CHROME_BIN" \
+    --no-sandbox \
+    --disable-dev-shm-usage \
+    --kiosk \
+    --noerrdialogs \
+    --disable-infobars \
+    --disable-session-crashed-bubble \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-sync \
+    --disable-notifications \
+    --disable-background-networking \
+    --disable-component-update \
+    --disable-features=TranslateUI,BackForwardCache,BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights \
+    --overscroll-history-navigation=0 \
+    --autoplay-policy=no-user-gesture-required \
+    --allow-running-insecure-content \
+    --unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:8765 \
+    --user-data-dir="$CHROME_PROFILE" \
+    "$URL" >> "$CHROMIUM_LOG" 2>&1 &
 
   CHROME_PID=$!
   echo "$CHROME_PID" > "$KIOSK_PIDFILE" 2>/dev/null || true
@@ -255,14 +270,14 @@ while true; do
     NOW="$(date +%s)"
     ELAPSED=$((NOW - START_TS))
 
-    # Keep UI heartbeat fresh if daemon responds (optional bridge)
+    # Optional bridge heartbeat
     bridge_ui_heartbeat
 
-    # Re-pick heartbeat sources each tick (in case /run appears later)
+    # Re-pick heartbeat sources each tick
     UI_HB_FILE="$(_pick_primary_or_fallback "$UI_HEARTBEAT_RUN" "$UI_HEARTBEAT_TMP")"
     WP_HB_FILE="$(_pick_primary_or_fallback "$WP_HEARTBEAT_RUN" "$WP_HEARTBEAT_TMP")"
 
-    # UI watchdog (only after grace period)
+    # UI watchdog (after grace)
     if [ -n "$UI_HB_FILE" ] && [ "$ELAPSED" -gt "$HEARTBEAT_GRACE" ]; then
       UI_AGE="$(_age_of_file "$UI_HB_FILE")"
       if [ "$UI_AGE" -gt "$UI_HEARTBEAT_MAX_AGE" ]; then
@@ -272,7 +287,7 @@ while true; do
       fi
     fi
 
-    # WP watchdog: if stale AND we aren't already offline, restart to switch URL
+    # WP watchdog: if stale and not already offline, restart to switch URL
     if [ -n "$WP_HB_FILE" ] && [ "$ELAPSED" -gt "$HEARTBEAT_GRACE" ] && [ "$URL" != "$OFFLINE_URL" ]; then
       WP_AGE="$(_age_of_file "$WP_HB_FILE")"
       if [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ]; then
@@ -293,7 +308,6 @@ while true; do
 
   if [ "$CNT" -gt "$MAX_RESTARTS_IN_WINDOW" ]; then
     log "[Meadow] Too many restarts (${CNT} in ${RESTART_WINDOW_SECS}s) — stopping kiosk"
-    # Set stop flag (prefer /run, also drop /tmp for compatibility)
     echo "$(date -Is 2>/dev/null || date)" > "$STOP_FLAG_RUN" 2>/dev/null || true
     echo "$(date -Is 2>/dev/null || date)" > "$STOP_FLAG_TMP" 2>/dev/null || true
     exit 0
