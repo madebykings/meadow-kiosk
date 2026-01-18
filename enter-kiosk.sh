@@ -43,7 +43,6 @@ export XAUTHORITY="/home/meadow/.Xauthority"
 export XDG_RUNTIME_DIR="/run/user/1000"
 
 # Launch kiosk browser
-nohup /home/meadow/meadow-kiosk/kiosk-browser.sh \
-  >>/home/meadow/state/kiosk-enter.log 2>&1 &
+nohup bash /home/meadow/meadow-kiosk/kiosk-browser.sh >>/home/meadow/state/kiosk-enter.log 2>&1 &
 
 exit 0
