@@ -225,18 +225,20 @@ while true; do
   echo "----- $(date -Is 2>/dev/null || date) launching chromium url=$URL -----" >> "$CHROMIUM_LOG" 2>/dev/null || true
 
   # Launch chromium
-  "$CHROME_BIN" \
-    --kiosk \
-    --noerrdialogs \
-    --disable-infobars \
-    --disable-session-crashed-bubble \
-    --disable-features=TranslateUI \
-    --overscroll-history-navigation=0 \
-    --autoplay-policy=no-user-gesture-required \
-    --allow-running-insecure-content \
-    --unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:8765 \
-    --disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights \
-    "$URL" >> "$CHROMIUM_LOG" 2>&1 &
+"$CHROME_BIN" \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  --kiosk \
+  --noerrdialogs \
+  --disable-infobars \
+  --disable-session-crashed-bubble \
+  --disable-features=TranslateUI \
+  --overscroll-history-navigation=0 \
+  --autoplay-policy=no-user-gesture-required \
+  --allow-running-insecure-content \
+  --unsafely-treat-insecure-origin-as-secure=http://127.0.0.1:8765 \
+  --disable-features=BlockInsecurePrivateNetworkRequests,PrivateNetworkAccessSendPreflights \
+  "$URL" >> "$CHROMIUM_LOG" 2>&1
 
   CHROME_PID=$!
   echo "$CHROME_PID" > "$KIOSK_PIDFILE" 2>/dev/null || true
