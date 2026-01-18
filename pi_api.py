@@ -494,17 +494,28 @@ def _enter_kiosk() -> Tuple[bool, str]:
         if not os.path.exists(script):
             return False, f"missing_script:{script}"
 
+        # IMPORTANT: when called from systemd (pi_api), provide the GUI env
+        env = os.environ.copy()
+        env.setdefault("DISPLAY", ":0")
+        env.setdefault("XAUTHORITY", "/home/meadow/.Xauthority")
+        env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+
         # Run detached; don't block API call
-        subprocess.Popen(["bash", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(
+            ["bash", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
 
         # Give it a moment, then confirm something actually started
-        time.sleep(0.4)
+        time.sleep(0.7)
         if _kiosk_running():
             return True, ""
         return False, "failed_to_start"
     except Exception as e:
         return False, str(e)
-
 
         # Kill any previous kiosk processes (best-effort)
         subprocess.call(["pkill", "-f", r"kiosk-browser\.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -624,6 +635,52 @@ def _shutdown() -> Tuple[bool, str]:
         return True, ""
     except Exception as e:
         return False, str(e)
+
+
+def _restart_service() -> Tuple[bool, str]:
+    try:
+        subprocess.Popen(["sudo", "-n", "systemctl", "restart", "meadow-kiosk.service"])
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _kill_all() -> Tuple[bool, str]:
+    """
+    Best-effort: kill kiosk browser loop + kiosk chromium processes,
+    and set STOP_FLAG so kiosk-browser.sh doesn't instantly relaunch.
+    """
+    try:
+        # stop flag (both locations, just in case)
+        try:
+            os.makedirs(os.path.dirname(STOP_FLAG), exist_ok=True)
+            with open(STOP_FLAG, "w", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
+        except Exception:
+            pass
+
+        try:
+            with open("/tmp/meadow_kiosk_stop", "w", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + "\n")
+        except Exception:
+            pass
+
+        # kill the loop + chromium kiosk
+        subprocess.call(["pkill", "-f", r"kiosk-browser\.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.call(["pkill", "-f", r"chromium.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.call(["pkill", "-f", r"chromium-browser.*--kiosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # clear pidfile
+        try:
+            if os.path.exists(KIOSK_PIDFILE):
+                os.remove(KIOSK_PIDFILE)
+        except Exception:
+            pass
+
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
 
 
 
@@ -925,6 +982,10 @@ class Handler(BaseHTTPRequestHandler):
             a_ok, a_err = _reboot()
         elif action == "shutdown":
             a_ok, a_err = _shutdown()
+        elif action == "restart_service":
+            a_ok, a_err = _restart_service()
+        elif action == "kill_all":
+            a_ok, a_err = _kill_all()
         else:
             return _json_response(self, 400, {"ok": False, "error": "unknown_action", "action": action})
 
