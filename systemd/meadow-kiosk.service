@@ -3,14 +3,14 @@ Description=Meadow Kiosk Service
 After=network-online.target systemd-resolved.service
 Wants=network-online.target systemd-resolved.service
 
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
 [Service]
 Type=simple
 User=meadow
-
-RuntimeDirectory=meadow
-RuntimeDirectoryMode=0755
-
 WorkingDirectory=/home/meadow/meadow-kiosk
+
 Environment=PYTHONUNBUFFERED=1
 Environment=GIT_TERMINAL_PROMPT=0
 
@@ -18,35 +18,32 @@ Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/meadow/.Xauthority
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 
+Environment=MEADOW_ROOT=/home/meadow/meadow-kiosk
+Environment=MEADOW_STATE_DIR=/home/meadow/meadow-kiosk/state
+Environment=MEADOW_KIOSK_URL_FILE=/home/meadow/meadow-kiosk/kiosk.url
+Environment=MEADOW_OFFLINE_URL=file:///home/meadow/meadow-kiosk/offline.html
+
 Environment=MEADOW_KIOSK_STOP_FLAG=/run/meadow/kiosk_stop
 Environment=MEADOW_UI_HEARTBEAT_FILE=/run/meadow/ui_heartbeat
 Environment=MEADOW_WP_HEARTBEAT_FILE=/run/meadow/wp_heartbeat
 Environment=MEADOW_KIOSK_PIDFILE=/run/meadow/kiosk_browser.pid
+Environment=MEADOW_RESTART_LOG=/run/meadow/kiosk_restart_times
 
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git fetch --prune origin'
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git reset --hard origin/main'
-# Local HTTP API for the kiosk UI -> Pi (Sigma + vend)
 ExecStart=/usr/bin/python3 /home/meadow/meadow-kiosk/pi_api.py
 
-# Resilience
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=10
 
-# Hardening (safe defaults for this app)
-NoNewPrivileges=true
+# Keep some safe hardening, but DO NOT break Chromium namespace/sandbox
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
-RestrictSUIDSGID=true
-LockPersonality=true
-MemoryDenyWriteExecute=true
 RestrictRealtime=true
-RestrictNamespaces=true
 UMask=007
 
 StandardOutput=journal
