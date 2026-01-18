@@ -486,25 +486,25 @@ def _config_poll_loop() -> None:
 
 def _enter_kiosk() -> Tuple[bool, str]:
     """
-    Force enter kiosk mode (match enter-kiosk.sh behaviour):
-      - clear stop flags in BOTH locations
-      - kill any kiosk chromium + kiosk-browser loop
-      - launch kiosk-browser.sh detached
+    Enter kiosk mode by running the known-good enter-kiosk.sh
+    (clears stop flags, kills stale processes, starts kiosk-browser)
     """
     try:
-        # Ensure run dir exists (kiosk-browser.sh writes pid/restart files there)
-        try:
-            os.makedirs("/run/meadow", exist_ok=True)
-        except Exception:
-            pass
+        script = "/home/meadow/meadow-kiosk/enter-kiosk.sh"
+        if not os.path.exists(script):
+            return False, f"missing_script:{script}"
 
-        # Clear stop flags + stale pidfile (both old and new locations)
-        for p in ("/run/meadow/kiosk_stop", "/tmp/meadow_kiosk_stop", STOP_FLAG, KIOSK_PIDFILE):
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
+        # Run detached; don't block API call
+        subprocess.Popen(["bash", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Give it a moment, then confirm something actually started
+        time.sleep(0.4)
+        if _kiosk_running():
+            return True, ""
+        return False, "failed_to_start"
+    except Exception as e:
+        return False, str(e)
+
 
         # Kill any previous kiosk processes (best-effort)
         subprocess.call(["pkill", "-f", r"kiosk-browser\.sh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
