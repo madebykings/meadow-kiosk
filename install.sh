@@ -13,11 +13,15 @@ sudo apt update
 sudo apt upgrade -y
 
 echo "=== Installing system dependencies ==="
+# NOTE: rsync is required because we use it to sync the repo into TARGET_DIR
 sudo apt install -y \
   git \
+  rsync \
   python3 \
+  python3-pip \
   python3-serial \
   python3-rpi-lgpio \
+  python3-gpiozero \
   python3-tk \
   chromium \
   unclutter \
@@ -44,13 +48,23 @@ else
   echo "=== Running from ${TARGET_DIR} (no repo sync needed) ==="
 fi
 
+echo "=== Install python deps (best-effort) ==="
+# Keeps existing functionality; just reduces “service died due to missing module” cases.
+if [ -f "${TARGET_DIR}/requirements.txt" ]; then
+  sudo -H python3 -m pip install --upgrade pip
+  sudo -H python3 -m pip install -r "${TARGET_DIR}/requirements.txt" || true
+else
+  # Minimal set commonly needed by pi_api.py + wp comms + sigma serial clients.
+  sudo -H python3 -m pip install --upgrade pip
+  sudo -H python3 -m pip install flask requests pyserial || true
+fi
+
 echo "=== Kill any stray kiosk processes (belt + braces) ==="
 # New canonical paths
 sudo pkill -f "${TARGET_DIR}/kiosk-browser\.sh" 2>/dev/null || true
 sudo pkill -f "kiosk-browser\.sh" 2>/dev/null || true
 sudo pkill -f "chromium.*--kiosk" 2>/dev/null || true
 sudo pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true
-
 # Also kill legacy paths if they exist (from older installs)
 sudo pkill -f "/home/meadow/kiosk-browser\.sh" 2>/dev/null || true
 
@@ -120,6 +134,7 @@ export XAUTHORITY="/home/meadow/.Xauthority"
 export XDG_RUNTIME_DIR="/run/user/1000"
 
 nohup bash "${ROOT}/kiosk-browser.sh" >>"${STATE_DIR}/kiosk-enter.log" 2>&1 &
+
 exit 0
 EOF
 
@@ -154,11 +169,11 @@ echo "=== Configure hotkeys (xbindkeys) ==="
 cat <<'EOF' | sudo tee /home/meadow/.xbindkeysrc >/dev/null
 # Exit kiosk
 "/home/meadow/meadow-kiosk/exit-kiosk.sh"
-control+alt + e
+  control+alt + e
 
 # Refresh current page (best-effort)
 "xdotool key --clearmodifiers ctrl+r"
-control + r
+  control + r
 EOF
 sudo chown "${MEADOW_USER}:${MEADOW_GROUP}" /home/meadow/.xbindkeysrc
 
@@ -172,6 +187,60 @@ Exec=/usr/bin/xbindkeys -f /home/meadow/.xbindkeysrc
 X-GNOME-Autostart-enabled=true
 EOF
 
+echo "=== Pi 5 EEPROM auto-boot sanity check (WAIT_FOR_POWER_BUTTON / POWER_OFF_ON_HALT) ==="
+
+# rpi-eeprom-config is provided by the rpi-eeprom package (usually present on Pi OS)
+if command -v rpi-eeprom-config >/dev/null 2>&1; then
+  # Show current effective config (non-interactive)
+  EEPROM_CFG="$(sudo -E rpi-eeprom-config 2>/dev/null || true)"
+
+  WAIT_VAL="$(echo "${EEPROM_CFG}" | grep -E '^\s*WAIT_FOR_POWER_BUTTON=' | tail -n 1 | cut -d= -f2 | tr -d '[:space:]' || true)"
+  HALT_VAL="$(echo "${EEPROM_CFG}" | grep -E '^\s*POWER_OFF_ON_HALT='     | tail -n 1 | cut -d= -f2 | tr -d '[:space:]' || true)"
+
+  # Defaults you want for kiosk/auto-boot when power is applied:
+  #   WAIT_FOR_POWER_BUTTON=0
+  #   POWER_OFF_ON_HALT=0
+  #
+  # If WAIT_FOR_POWER_BUTTON=1 and/or POWER_OFF_ON_HALT=1, the Pi can enter STANDBY and require a button press
+  # after power is applied (especially "first power on after cable connected").
+  if [[ "${WAIT_VAL:-}" == "1" || "${HALT_VAL:-}" == "1" ]]; then
+    echo ""
+    echo "!!! WARNING: Pi EEPROM bootloader config suggests it may wait for the power button !!!"
+    echo "    Detected: WAIT_FOR_POWER_BUTTON=${WAIT_VAL:-<unset>}  POWER_OFF_ON_HALT=${HALT_VAL:-<unset>}"
+    echo ""
+    echo "For auto-boot on power apply, set:"
+    echo "  WAIT_FOR_POWER_BUTTON=0"
+    echo "  POWER_OFF_ON_HALT=0"
+    echo ""
+    echo "Fix (interactive):"
+    echo "  sudo -E rpi-eeprom-config --edit"
+    echo "Then save + reboot:"
+    echo "  sudo reboot"
+    echo ""
+  else
+    echo "[Meadow] EEPROM config looks OK for auto-boot (WAIT_FOR_POWER_BUTTON=${WAIT_VAL:-<unset>} POWER_OFF_ON_HALT=${HALT_VAL:-<unset>})"
+  fi
+else
+  echo "[Meadow] rpi-eeprom-config not found; skipping EEPROM check."
+  echo "         (On Pi OS you can install: sudo apt install -y rpi-eeprom)"
+fi
+
+echo "=== Pi 5 USB boot power hint (usb_max_current_enable=1) ==="
+CFG="/boot/firmware/config.txt"
+if [[ -f "${CFG}" ]]; then
+  if grep -qE '^\s*usb_max_current_enable\s*=\s*1\s*$' "${CFG}"; then
+    echo "[Meadow] ${CFG} already has usb_max_current_enable=1"
+  else
+    echo "[Meadow] Adding usb_max_current_enable=1 to ${CFG} (safe; helps some USB/NVMe boot on non-PD/GPIO power)"
+    echo "" | sudo tee -a "${CFG}" >/dev/null
+    echo "usb_max_current_enable=1" | sudo tee -a "${CFG}" >/dev/null
+  fi
+else
+  echo "[Meadow] ${CFG} not found; skipping usb_max_current_enable hint."
+  echo "         (On your image it should be /boot/firmware/config.txt)"
+fi
+
+
 echo "=== Install systemd service (Pi API) ==="
 sudo install -m 644 "${TARGET_DIR}/systemd/meadow-kiosk.service" /etc/systemd/system/meadow-kiosk.service
 sudo systemctl daemon-reload
@@ -182,8 +251,8 @@ echo "=== Install complete ==="
 echo ""
 echo "Canonical install dir: ${TARGET_DIR}"
 echo "Hotkeys:"
-echo "  Ctrl+Alt+E = Exit kiosk"
-echo "  Ctrl+R     = Refresh"
+echo " Ctrl+Alt+E = Exit kiosk"
+echo " Ctrl+R = Refresh"
 echo ""
 echo "Start kiosk:"
-echo "  bash ${TARGET_DIR}/enter-kiosk.sh"
+echo " bash ${TARGET_DIR}/enter-kiosk.sh"
