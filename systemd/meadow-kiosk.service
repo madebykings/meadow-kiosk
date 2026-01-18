@@ -14,6 +14,10 @@ WorkingDirectory=/home/meadow/meadow-kiosk
 Environment=PYTHONUNBUFFERED=1
 Environment=GIT_TERMINAL_PROMPT=0
 
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/meadow/.Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
 Environment=MEADOW_KIOSK_STOP_FLAG=/run/meadow/kiosk_stop
 Environment=MEADOW_UI_HEARTBEAT_FILE=/run/meadow/ui_heartbeat
 Environment=MEADOW_WP_HEARTBEAT_FILE=/run/meadow/wp_heartbeat
