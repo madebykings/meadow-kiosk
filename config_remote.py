@@ -4,7 +4,7 @@ import time
 import requests
 
 PROVISION_PATH = "/boot/provision.json"
-CACHE_PATH = "/home/meadow/kiosk.config.cache.json"
+CACHE_PATH = "/home/meadow/meadow-kiosk/kiosk.config.cache.json"
 
 
 # ------------------------------------------------------------
