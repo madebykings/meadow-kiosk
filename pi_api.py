@@ -861,11 +861,11 @@ class Handler(BaseHTTPRequestHandler):
             lock.release()
 
     def _handle_sigma_purchase(self) -> None:
-    data = _read_json(self)
-    amount_minor = data.get("amount_minor")
-    currency_num = str(data.get("currency_num") or "826")
-    reference = str(data.get("reference") or "")[:64]
-    order_id = int(data.get("order_id") or 0)  # ✅ NEW
+      data = _read_json(self)
+      amount_minor = data.get("amount_minor")
+      currency_num = str(data.get("currency_num") or "826")
+      reference = str(data.get("reference") or "")[:64]
+      order_id = int(data.get("order_id") or 0)  # ✅ NEW
 
     try:
         amount_minor_int = int(amount_minor)
