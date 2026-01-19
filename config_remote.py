@@ -42,8 +42,6 @@ def safe_fallback_config(prov=None, imei=None, reason=None):
     """
     Minimal config that guarantees kiosk.py can boot.
     Used when WP + cache are unavailable or invalid.
-
-    IMPORTANT: Must include keys that kiosk.py directly indexes.
     """
     domain = ""
     kiosk_token = ""
@@ -59,12 +57,10 @@ def safe_fallback_config(prov=None, imei=None, reason=None):
         "kiosk_token": kiosk_token,
         "imei": imei or "",
 
-        # Keys kiosk.py expects to exist:
-        "motors": {},          # motor_id -> GPIO pin
-        "spin_time": {},       # motor_id -> seconds
-        "motor_pulse_ms": 350, # if you use pulse-based mode anywhere
+        "motors": {},
+        "spin_time": {},
+        "motor_pulse_ms": 350,
 
-        # Behaviour flags:
         "vend": {"enabled": False},
         "payment": {"enabled": False},
         "ads": {"enabled": True},
@@ -76,19 +72,14 @@ def safe_fallback_config(prov=None, imei=None, reason=None):
 def normalize_config(cfg, prov=None, imei=None):
     """
     Ensure kiosk.py never crashes due to missing keys.
-
-    Add here every config key that kiosk.py uses via cfg["..."].
-    (We already know motors + spin_time are required.)
     """
     if not isinstance(cfg, dict):
         cfg = {}
 
-    # --- Required keys (kiosk.py indexes directly) ---
-    cfg.setdefault("motors", {})       # motor_id -> GPIO pin
-    cfg.setdefault("spin_time", {})    # motor_id -> seconds
+    cfg.setdefault("motors", {})
+    cfg.setdefault("spin_time", {})
     cfg.setdefault("motor_pulse_ms", 350)
 
-    # --- Identifiers ---
     if prov and isinstance(prov, dict):
         cfg.setdefault(
             "domain",
@@ -102,24 +93,20 @@ def normalize_config(cfg, prov=None, imei=None):
     if imei:
         cfg.setdefault("imei", imei)
 
-    # --- Behaviour defaults ---
     cfg.setdefault("vend", {})
     cfg.setdefault("payment", {})
     cfg.setdefault("ads", {})
 
-    # If motors or spin_time are missing/empty, force safe mode & disable vend/payment
     if not cfg.get("motors") or not cfg.get("spin_time"):
         cfg.setdefault("mode", "safe")
         cfg["vend"]["enabled"] = False
         cfg["payment"]["enabled"] = False
         cfg["ads"].setdefault("enabled", True)
 
-    # Always ensure enabled flags exist
     cfg["vend"].setdefault("enabled", True)
     cfg["payment"].setdefault("enabled", True)
     cfg["ads"].setdefault("enabled", True)
 
-    # Timestamp marker
     cfg.setdefault("updated_at", int(time.time()))
 
     return cfg
@@ -133,11 +120,11 @@ def fetch_config_from_wp(prov, imei=None, timeout=10):
     """
     Fetch per-kiosk config from WordPress.
 
-    provision.json expected minimum:
+    provision.json MUST contain:
       {
         "domain": "https://meadowvending.com",
         "kiosk_token": "UNIT-0001-SPARTAN",
-        "api_key": "MASTER-PROVISION-KEY"
+        "provision_key": "MASTER-PROVISION-KEY"
       }
 
     WP endpoint:
@@ -145,16 +132,18 @@ def fetch_config_from_wp(prov, imei=None, timeout=10):
     """
     domain = (prov.get("domain") or prov.get("provision_url") or "").strip()
     kiosk_token = (prov.get("kiosk_token") or prov.get("token") or "").strip()
-    master_key = (prov.get("api_key") or prov.get("key") or "").strip()
+    provision_key = (prov.get("provision_key") or "").strip()
 
-    if not domain or not kiosk_token or not master_key:
+    if not domain or not kiosk_token or not provision_key:
         raise RuntimeError(
-            f"provision.json missing domain/kiosk_token/api_key. Keys present: {list(prov.keys())}"
+            "provision.json missing domain/kiosk_token/provision_key. "
+            f"Keys present: {list(prov.keys())}"
         )
 
     url = domain.rstrip("/") + "/wp-json/meadow/v1/kiosk-config"
 
-    params = {"token": kiosk_token, "key": master_key}
+    # WP expects 'key' query param today; keep that stable.
+    params = {"token": kiosk_token, "key": provision_key}
     if imei:
         params["imei"] = imei
 
