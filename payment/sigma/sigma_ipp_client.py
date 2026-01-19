@@ -295,21 +295,21 @@ class SigmaIppClient:
             self.log.debug(f"RX ({label}) {props} RAW={raw!r}")
 
     def _wait_for_sid(
-    self,
-    method: str,
-    sid: str,
-    first_wait: float,
-    final_wait: float,
-    log_other: bool = True,
-    on_match: Optional[Callable[[Dict[str, str], bool], None]] = None,
-) -> Optional[SigmaFrame]:
-    """
-    Wait for frames matching METHOD+SID.
-    - waits for first matching frame up to first_wait
-    - if STATUS != 0 returns immediately
-    - else continues until final frame (TIMEOUT missing/0) or final_wait
-    - optional on_match(props, is_final) callback for each matching frame
-    """
+        self,
+        method: str,
+        sid: str,
+        first_wait: float,
+        final_wait: float,
+        log_other: bool = True,
+        on_match: Optional[Callable[[Dict[str, str], bool], None]] = None,
+        ) -> Optional[SigmaFrame]:
+        """
+        Wait for frames matching METHOD+SID.
+        - waits for first matching frame up to first_wait
+        - if STATUS != 0 returns immediately
+        - else continues until final frame (TIMEOUT missing/0) or final_wait
+        - optional on_match(props, is_final) callback for each matching frame
+        """
     if not self._ser or not self._ser.is_open:
         self.open()
     assert self._ser is not None
@@ -469,13 +469,13 @@ class SigmaIppClient:
         final_wait: float = 180.0,
         on_phase: Optional[Callable[[str, Dict[str, str]], None]] = None,
         ) -> Dict[str, Any]:
-    """
-    PURCHASE using amount in minor units (e.g. 100 for £1.00).
+        """
+        PURCHASE using amount in minor units (e.g. 100 for £1.00).
 
-    on_phase callback:
-      on_phase("finalising", props) fires exactly when we detect "card tapped"
-      based on STAGE transition to 2 (your logs: 11 -> 2).
-    """
+        on_phase callback:
+          on_phase("finalising", props) fires exactly when we detect "card tapped"
+          based on STAGE transition to 2 (your logs: 11 -> 2).
+        """
     if not self._ser or not self._ser.is_open:
         self.open()
 
