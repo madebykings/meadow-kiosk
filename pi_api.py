@@ -175,6 +175,33 @@ class _SigmaGlobalLock:
 # Helpers
 # -------------------------------------------------------------------
 
+def _wp_set_screen_mode(mode: str, order_id: int = 0) -> None:
+    """
+    Best-effort: tell WP to set the kiosk screen mode.
+    Uses /wp-json/meadow/v1/kiosk-screen (POST).
+    Never raises.
+    """
+    try:
+        kiosk_id, key, domain = STATE.get_auth()
+        if not domain or not kiosk_id:
+            return
+
+        url = domain.rstrip("/") + "/wp-json/meadow/v1/kiosk-screen"
+        payload: Dict[str, Any] = {
+            "kiosk_id": int(kiosk_id),
+            "mode": str(mode),
+        }
+        if int(order_id) > 0:
+            payload["order_id"] = int(order_id)
+
+        # key may or may not be checked server-side; harmless to include
+        if key:
+            payload["key"] = key
+
+        requests.post(url, json=payload, timeout=2)
+    except Exception:
+        return
+
 def _cors_origin(handler: BaseHTTPRequestHandler) -> str:
     return handler.headers.get("Origin") or "*"
 
@@ -867,13 +894,19 @@ class Handler(BaseHTTPRequestHandler):
 
                 try:
                     with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
+                        def _on_phase(phase: str, props: Dict[str, str]) -> None:
+                        # Only care about our new phase
+                          if phase == "finalising":
+                            _wp_set_screen_mode("finalising")
+
                         r = sigma.purchase(
-                            amount_minor=amount_minor_int,
-                            currency_num=currency_num,
-                            reference=reference,
-                            first_wait=25.0,
-                            final_wait=180.0,
-                        )
+                          amount_minor=amount_minor_int,
+                          currency_num=currency_num,
+                          reference=reference,
+                          first_wait=25.0,
+                          final_wait=180.0,
+                          on_phase=_on_phase,
+                        )  
                         try:
                             sigma.ensure_idle(max_total_wait=10.0)
                         except Exception:
