@@ -814,182 +814,141 @@ class Handler(BaseHTTPRequestHandler):
     # -----------------------------
     # Sigma
     # -----------------------------
+  
+    def _handle_sigma_purchase(self) -> None:
+        data = _read_json(self)
 
-    def _handle_sigma_warm(self) -> None:
-        _ = _read_json(self)
+        amount_minor = data.get("amount_minor")
+        currency_num = str(data.get("currency_num") or "826")
+        reference    = str(data.get("reference") or "")[:64]
 
-        sigma_path, sigma_baud = STATE.get_sigma()
-        port_candidates = [sigma_path, "/dev/sigma", "/dev/ttyACM0", "/dev/ttyUSB0"]
+        try:
+            order_id = int(data.get("order_id") or 0)
+        except Exception:
+            order_id = 0
+
+        # -----------------------------
+        # Validate amount
+        # -----------------------------
+        try:
+            amount_minor_int = int(amount_minor)
+            if amount_minor_int <= 0:
+                raise ValueError("amount_minor must be > 0")
+        except Exception:
+            return _json_response(self, 400, {
+                "ok": False,
+                "error": "bad_amount",
+            })
 
         t0 = time.time()
+
+        # -----------------------------
+        # Global Sigma lock
+        # -----------------------------
         lock = _SigmaGlobalLock(SIGMA_LOCKFILE)
-        if not lock.acquire(timeout=SIGMA_BUSY_LOCK_TIMEOUT):
-            return _json_response(self, 200, {
-                "ok": True,
-                "warm_skipped": True,
-                "reason": "sigma_busy",
+        if not lock.acquire(timeout=SIGMA_PURCHASE_LOCK_TIMEOUT):
+            return _json_response(self, 423, {
+                "ok": False,
+                "error": "sigma_busy_try_again",
+                "retry_ms": 900,
                 "t_ms": int((time.time() - t0) * 1000),
             })
 
         try:
+            sigma_path, sigma_baud = STATE.get_sigma()
+            port_candidates = [
+                sigma_path,
+                "/dev/sigma",
+                "/dev/ttyACM0",
+                "/dev/ttyUSB0",
+            ]
+
             last_err = ""
+
             for port in port_candidates:
                 if not port or not os.path.exists(port):
                     continue
+
                 try:
                     with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
-                        idle_ok = sigma.ensure_idle(max_total_wait=SIGMA_WARM_MAX_WAIT_SECS)
+
+                        # -----------------------------
+                        # Phase callback from Sigma
+                        # -----------------------------
+                        def _on_phase(phase: str, props: Dict[str, str]) -> None:
+                            if phase == "finalising":
+                                # Flip UI ASAP when card tap accepted / auth started
+                                try:
+                                    if order_id > 0:
+                                        _wp_set_screen_mode("finalising", order_id)
+                                    else:
+                                        _wp_set_screen_mode("finalising")
+                                except Exception:
+                                    pass
+
+                        r = sigma.purchase(
+                            amount_minor=amount_minor_int,
+                            currency_num=currency_num,
+                            reference=reference,
+                            first_wait=25.0,
+                            final_wait=180.0,
+                            on_phase=_on_phase,
+                        )
+
+                        # Ensure terminal is clean before releasing lock
+                        try:
+                            sigma.ensure_idle(max_total_wait=10.0)
+                        except Exception:
+                            pass
+
+                    # -----------------------------
+                    # Parse result
+                    # -----------------------------
+                    status   = str(r.get("status") or "")
+                    stage    = str(r.get("stage") or "")
+                    approved = bool(r.get("approved"))
+
+                    raw = r.get("raw") or {}
+                    if not isinstance(raw, dict):
+                        raw = {}
+
+                    payload = {
+                        "approved": approved,
+                        "status": status,
+                        "stage": stage,
+                        "raw": raw,
+                        "receipt": raw.get("RECEIPT", ""),
+                        "txid": str(raw.get("TXID") or raw.get("RRN") or ""),
+                        "port": port,
+                        "t_ms": int((time.time() - t0) * 1000),
+                    }
+
+                    if status and status != "0" and not approved:
+                        return _json_response(self, 409, {
+                            "ok": False,
+                            "error": "sigma_rejected",
+                            **payload,
+                        })
 
                     return _json_response(self, 200, {
                         "ok": True,
-                        "warm_skipped": False,
-                        "idle_ok": bool(idle_ok),
-                        "port": port,
-                        "t_ms": int((time.time() - t0) * 1000),
+                        **payload,
                     })
+
                 except Exception as e:
-                    last_err = "".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:]
+                    last_err = "".join(
+                        traceback.format_exception(type(e), e, e.__traceback__)
+                    )[-2000:]
                     continue
 
             return _json_response(self, 502, {
                 "ok": False,
-                "error": "sigma_warm_failed",
+                "error": "sigma_failed",
                 "detail": last_err,
-                "t_ms": int((time.time() - t0) * 1000),
             })
+
         finally:
             lock.release()
-
-    def _handle_sigma_purchase(self) -> None:
-      data = _read_json(self)
-
-      amount_minor = data.get("amount_minor")
-      currency_num = str(data.get("currency_num") or "826")
-      reference    = str(data.get("reference") or "")[:64]
-      order_id     = int(data.get("order_id") or 0)
-
-    # -----------------------------
-    # Validate amount
-    # -----------------------------
-    try:
-        amount_minor_int = int(amount_minor)
-        if amount_minor_int <= 0:
-            raise ValueError("amount_minor must be > 0")
-    except Exception:
-        return _json_response(self, 400, {
-            "ok": False,
-            "error": "bad_amount",
-        })
-
-    t0 = time.time()
-
-    # -----------------------------
-    # Global Sigma lock
-    # -----------------------------
-    lock = _SigmaGlobalLock(SIGMA_LOCKFILE)
-    if not lock.acquire(timeout=SIGMA_PURCHASE_LOCK_TIMEOUT):
-        return _json_response(self, 423, {
-            "ok": False,
-            "error": "sigma_busy_try_again",
-            "retry_ms": 900,
-            "t_ms": int((time.time() - t0) * 1000),
-        })
-
-    try:
-        sigma_path, sigma_baud = STATE.get_sigma()
-        port_candidates = [
-            sigma_path,
-            "/dev/sigma",
-            "/dev/ttyACM0",
-            "/dev/ttyUSB0",
-        ]
-
-        last_err = ""
-
-        for port in port_candidates:
-            if not port or not os.path.exists(port):
-                continue
-
-            try:
-                with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
-
-                    # -----------------------------
-                    # Phase callback from Sigma
-                    # -----------------------------
-                    def _on_phase(phase: str, props: Dict[str, str]) -> None:
-                        if phase == "finalising":
-                            # Flip UI ASAP when card tap accepted / auth started
-                            try:
-                                if order_id > 0:
-                                    _wp_set_screen_mode("finalising", order_id)
-                                else:
-                                    _wp_set_screen_mode("finalising")
-                            except Exception:
-                                pass
-
-                    r = sigma.purchase(
-                        amount_minor=amount_minor_int,
-                        currency_num=currency_num,
-                        reference=reference,
-                        first_wait=25.0,
-                        final_wait=180.0,
-                        on_phase=_on_phase,
-                    )
-
-                    # Ensure terminal is clean before releasing lock
-                    try:
-                        sigma.ensure_idle(max_total_wait=10.0)
-                    except Exception:
-                        pass
-
-                # -----------------------------
-                # Parse result
-                # -----------------------------
-                status   = str(r.get("status") or "")
-                stage    = str(r.get("stage") or "")
-                approved = bool(r.get("approved"))
-
-                raw = r.get("raw") or {}
-                if not isinstance(raw, dict):
-                    raw = {}
-
-                payload = {
-                    "approved": approved,
-                    "status": status,
-                    "stage": stage,
-                    "raw": raw,
-                    "receipt": raw.get("RECEIPT", ""),
-                    "txid": str(raw.get("TXID") or raw.get("RRN") or ""),
-                    "port": port,
-                    "t_ms": int((time.time() - t0) * 1000),
-                }
-
-                if status and status != "0" and not approved:
-                    return _json_response(self, 409, {
-                        "ok": False,
-                        "error": "sigma_rejected",
-                        **payload,
-                    })
-
-                return _json_response(self, 200, {
-                    "ok": True,
-                    **payload,
-                })
-
-            except Exception as e:
-                last_err = "".join(
-                    traceback.format_exception(type(e), e, e.__traceback__)
-                )[-2000:]
-                continue
-
-        return _json_response(self, 502, {
-            "ok": False,
-            "error": "sigma_failed",
-            "detail": last_err,
-        })
-
-    finally:
-        lock.release()
 
     # -----------------------------
     # Vend (async / non-blocking)
