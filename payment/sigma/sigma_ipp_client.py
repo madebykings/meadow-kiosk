@@ -41,7 +41,7 @@ import time
 import uuid
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Callable
 
 import serial
 
@@ -295,65 +295,87 @@ class SigmaIppClient:
             self.log.debug(f"RX ({label}) {props} RAW={raw!r}")
 
     def _wait_for_sid(
-        self,
-        method: str,
-        sid: str,
-        first_wait: float,
-        final_wait: float,
-        log_other: bool = True,
-    ) -> Optional[SigmaFrame]:
-        """
-        Wait for frames matching METHOD+SID.
-        - waits for first matching frame up to first_wait
-        - if STATUS != 0 returns immediately
-        - else continues until final frame (TIMEOUT missing/0) or final_wait
-        """
-        if not self._ser or not self._ser.is_open:
-            self.open()
-        assert self._ser is not None
+    self,
+    method: str,
+    sid: str,
+    first_wait: float,
+    final_wait: float,
+    log_other: bool = True,
+    on_match: Optional[Callable[[Dict[str, str], bool], None]] = None,
+) -> Optional[SigmaFrame]:
+    """
+    Wait for frames matching METHOD+SID.
+    - waits for first matching frame up to first_wait
+    - if STATUS != 0 returns immediately
+    - else continues until final frame (TIMEOUT missing/0) or final_wait
+    - optional on_match(props, is_final) callback for each matching frame
+    """
+    if not self._ser or not self._ser.is_open:
+        self.open()
+    assert self._ser is not None
 
-        end_first = time.time() + float(first_wait)
-        first: Optional[Dict[str, str]] = None
-        first_raw: str = ""
-        while time.time() < end_first:
-            got = _read_one_frame(self._ser, timeout_s=1.0)
-            if not got:
-                continue
-            props, raw = got
-            if log_other and not (props.get("METHOD") == method and props.get("SID") == sid):
-                self.log.debug(f"RX(other) {props} RAW={raw!r}")
+    end_first = time.time() + float(first_wait)
+    first: Optional[Dict[str, str]] = None
+    first_raw: str = ""
 
-            if props.get("METHOD") == method and props.get("SID") == sid:
-                first = props
-                first_raw = raw
-                self.log.debug(f"RX({method} first) {props} RAW={raw!r}")
+    while time.time() < end_first:
+        got = _read_one_frame(self._ser, timeout_s=1.0)
+        if not got:
+            continue
+        props, raw = got
+
+        if log_other and not (props.get("METHOD") == method and props.get("SID") == sid):
+            self.log.debug(f"RX(other) {props} RAW={raw!r}")
+
+        if props.get("METHOD") == method and props.get("SID") == sid:
+            first = props
+            first_raw = raw
+            self.log.debug(f"RX({method} first) {props} RAW={raw!r}")
+
+            if on_match:
+                try:
+                    on_match(props, _timeout_is_final(props))
+                except Exception:
+                    pass
+
+            break
+
+    if not first:
+        return None
+
+    # If first frame is an error, return immediately (matches current behavior)
+    if str(first.get("STATUS") or "") != "0":
+        return SigmaFrame(props=first, raw_text=first_raw, sid=sid, method=method)
+
+    last = first
+    last_raw = first_raw
+
+    end = time.time() + float(final_wait)
+    while time.time() < end:
+        got = _read_one_frame(self._ser, timeout_s=5.0)
+        if not got:
+            continue
+        props, raw = got
+
+        if log_other and not (props.get("METHOD") == method and props.get("SID") == sid):
+            self.log.debug(f"RX(other) {props} RAW={raw!r}")
+
+        if props.get("METHOD") == method and props.get("SID") == sid:
+            last = props
+            last_raw = raw
+            self.log.debug(f"RX({method}) {props} RAW={raw!r}")
+
+            is_final = _timeout_is_final(props)
+            if on_match:
+                try:
+                    on_match(props, is_final)
+                except Exception:
+                    pass
+
+            if is_final:
                 break
 
-        if not first:
-            return None
-
-        if str(first.get("STATUS") or "") != "0":
-            return SigmaFrame(props=first, raw_text=first_raw, sid=sid, method=method)
-
-        last = first
-        last_raw = first_raw
-        end = time.time() + float(final_wait)
-        while time.time() < end:
-            got = _read_one_frame(self._ser, timeout_s=5.0)
-            if not got:
-                continue
-            props, raw = got
-            if log_other and not (props.get("METHOD") == method and props.get("SID") == sid):
-                self.log.debug(f"RX(other) {props} RAW={raw!r}")
-
-            if props.get("METHOD") == method and props.get("SID") == sid:
-                last = props
-                last_raw = raw
-                self.log.debug(f"RX({method}) {props} RAW={raw!r}")
-                if _timeout_is_final(props):
-                    break
-
-        return SigmaFrame(props=last, raw_text=last_raw, sid=sid, method=method)
+    return SigmaFrame(props=last, raw_text=last_raw, sid=sid, method=method)
 
     def _send_and_wait_final(
         self,
@@ -439,64 +461,100 @@ class SigmaIppClient:
     # -----------------------------
 
     def purchase(
-        self,
-        amount_minor: int,
-        currency_num: str = "826",
-        reference: str = "",
-        first_wait: float = 25.0,
-        final_wait: float = 180.0,
-    ) -> Dict[str, Any]:
-        """
-        PURCHASE using amount in minor units (e.g. 100 for £1.00).
-        Returns dict compatible with your existing API expectations.
-        """
-        if not self._ser or not self._ser.is_open:
-            self.open()
+    self,
+    amount_minor: int,
+    currency_num: str = "826",
+    reference: str = "",
+    first_wait: float = 25.0,
+    final_wait: float = 180.0,
+    on_phase: Optional[Callable[[str, Dict[str, str]], None]] = None,
+) -> Dict[str, Any]:
+    """
+    PURCHASE using amount in minor units (e.g. 100 for £1.00).
 
-        # Best-effort: flush any stray frames before starting
-        self._drain(seconds=2.0, label="pre-purchase-drain")
+    on_phase callback:
+      on_phase("finalising", props) fires exactly when we detect "card tapped"
+      based on STAGE transition to 2 (your logs: 11 -> 2).
+    """
+    if not self._ser or not self._ser.is_open:
+        self.open()
 
-        if not self.ensure_idle(max_total_wait=45.0):
-            raise SigmaTimeout("Terminal not idle before purchase")
+    # Best-effort: flush any stray frames before starting
+    self._drain(seconds=2.0, label="pre-purchase-drain")
 
-        pounds = int(amount_minor) // 100
-        pence = int(amount_minor) % 100
-        amt_str = f"{pounds}.{pence:02d}"
-        extra = [
-            f"AMOUNT={amt_str}",
-            f"CURRENCY={str(currency_num)}",
-        ]
-        if reference:
-            extra.append(f"REFERENCE={reference[:64]}")
+    if not self.ensure_idle(max_total_wait=45.0):
+        raise SigmaTimeout("Terminal not idle before purchase")
 
-        sid = self._send_method("PURCHASE", extra_lines=extra)
+    pounds = int(amount_minor) // 100
+    pence = int(amount_minor) % 100
+    amt_str = f"{pounds}.{pence:02d}"
 
-        frame = self._wait_for_sid("PURCHASE", sid, first_wait=first_wait, final_wait=final_wait, log_other=True)
-        if not frame:
-            raise SigmaTimeout("No PURCHASE response within timeout")
+    extra = [
+        f"AMOUNT={amt_str}",
+        f"CURRENCY={str(currency_num)}",
+    ]
+    if reference:
+        extra.append(f"REFERENCE={reference[:64]}")
 
-        props = frame.props
-        status = str(props.get("STATUS") or "")
-        stage = str(props.get("STAGE") or "")
-        timeout = str(props.get("TIMEOUT") or "")
+    sid = self._send_method("PURCHASE", extra_lines=extra)
 
-        approved = (status == "0")
+    fired_finalising = False
+    last_stage_i = -1
 
-        # ✅ CRITICAL: clean terminal for NEXT transaction (Sigma sometimes leaves STATUS=20 after success)
+    def _on_purchase_frame(p: Dict[str, str], is_final: bool) -> None:
+        nonlocal fired_finalising, last_stage_i
+
+        # Parse STAGE safely
+        stage_str = str(p.get("STAGE") or "")
         try:
-            self.ensure_idle(max_total_wait=20.0)
-        except Exception as e:
-            self.log.debug(f"post-purchase ensure_idle failed: {e!r}")
+            stage_i = int(stage_str) if stage_str.isdigit() else -1
+        except Exception:
+            stage_i = -1
 
-        return {
-            "approved": approved,
-            "status": status,
-            "stage": stage,
-            "timeout": timeout,
-            "raw": props,
-            "sid": sid,
-        }
+        # ✅ Fire "finalising" when we move from tap prompt to card handled
+        # Your observed flow: STAGE=11 (tap card) -> STAGE=2 (after tap)
+        if (not fired_finalising) and (not is_final):
+            if stage_i == 2 and last_stage_i in (-1, 0, 1, 11):
+                fired_finalising = True
+                if on_phase:
+                    try:
+                        on_phase("finalising", p)
+                    except Exception:
+                        pass
 
+        last_stage_i = stage_i
+
+    frame = self._wait_for_sid(
+        "PURCHASE",
+        sid,
+        first_wait=first_wait,
+        final_wait=final_wait,
+        log_other=True,
+        on_match=_on_purchase_frame,
+    )
+    if not frame:
+        raise SigmaTimeout("No PURCHASE response within timeout")
+
+    props = frame.props
+    status = str(props.get("STATUS") or "")
+    stage = str(props.get("STAGE") or "")
+    timeout = str(props.get("TIMEOUT") or "")
+    approved = (status == "0")
+
+    # ✅ CRITICAL: clean terminal for NEXT transaction (Sigma sometimes leaves STATUS=20 after success)
+    try:
+        self.ensure_idle(max_total_wait=20.0)
+    except Exception as e:
+        self.log.debug(f"post-purchase ensure_idle failed: {e!r}")
+
+    return {
+        "approved": approved,
+        "status": status,
+        "stage": stage,
+        "timeout": timeout,
+        "raw": props,
+        "sid": sid,
+    }
 
 # -----------------------------
 # Compatibility wrapper (optional)
