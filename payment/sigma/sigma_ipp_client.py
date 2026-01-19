@@ -2,7 +2,7 @@
 """
 sigma_ipp_client.py — myPOS Sigma IPP-over-serial (USB CDC-ACM) production client
 
-Wire format (CONFIRMED by your working sigma_purchase.py):
+Wire format (CONFIRMED by your working sigma_purchase.py): 
 - 2-byte big-endian total length (INCLUDING these 2 bytes)
 - ASCII lines of "KEY=VALUE\r\n"
 - PROTOCOL must be first, METHOD must be second
