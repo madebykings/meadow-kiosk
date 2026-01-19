@@ -461,14 +461,14 @@ class SigmaIppClient:
     # -----------------------------
 
     def purchase(
-    self,
-    amount_minor: int,
-    currency_num: str = "826",
-    reference: str = "",
-    first_wait: float = 25.0,
-    final_wait: float = 180.0,
-    on_phase: Optional[Callable[[str, Dict[str, str]], None]] = None,
-) -> Dict[str, Any]:
+        self,
+        amount_minor: int,
+        currency_num: str = "826",
+        reference: str = "",
+        first_wait: float = 25.0,
+        final_wait: float = 180.0,
+        on_phase: Optional[Callable[[str, Dict[str, str]], None]] = None,
+        ) -> Dict[str, Any]:
     """
     PURCHASE using amount in minor units (e.g. 100 for £1.00).
 
