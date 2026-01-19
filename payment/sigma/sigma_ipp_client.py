@@ -516,9 +516,24 @@ class SigmaIppClient:
             if fired_finalising:
                 return
 
-            # Fire once when we first see an approved (STATUS=0) non-final frame.
-            # This lines up with the Sigma showing the "Auth ✅" tick.
-            if str(p.get("STATUS") or "") == "0" and not is_final:
+            # Sigma can emit STATUS=0 frames before the customer taps (e.g. "waiting for card").
+            # Only flip UI to "finalising" once auth really happened:
+            #  - typically STAGE >= 5 on your flow, OR
+            #  - we see real auth markers like TXID/RRN/AUTHCODE/etc.
+            stage_str = str(p.get("STAGE") or "")
+            try:
+                stage_i = int(stage_str) if stage_str.isdigit() else -1
+            except Exception:
+                stage_i = -1
+
+            has_auth_markers = bool(
+                (p.get("TXID") or "").strip()
+                or (p.get("RRN") or "").strip()
+                or (p.get("AUTHCODE") or "").strip()
+                or (p.get("APPROVAL") or "").strip()
+            )
+
+            if str(p.get("STATUS") or "") == "0" and (not is_final) and (stage_i >= 5 or has_auth_markers):
                 fired_finalising = True
                 if on_phase:
                     try:
