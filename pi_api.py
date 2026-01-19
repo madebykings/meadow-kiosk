@@ -913,8 +913,7 @@ class Handler(BaseHTTPRequestHandler):
                         sigma.ensure_idle(max_total_wait=10.0)
                       except Exception:
                         pass
-
-
+                        
                     status = str(r.get("status") or "")
                     stage = str(r.get("stage") or "")
                     approved = bool(r.get("approved"))
