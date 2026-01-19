@@ -895,23 +895,23 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with SigmaIppClient(port=port, baudrate=sigma_baud) as sigma:
 
-                    def _on_phase(phase: str, props: Dict[str, str]) -> None:
+                      def _on_phase(phase: str, props: Dict[str, str]) -> None:
                         # Card-tap moment (triggered from sigma_ipp_client.py on STAGE transition)
                         if phase == "finalising":
                           _wp_set_screen_mode("finalising")
 
-                    r = sigma.purchase(
+                      r = sigma.purchase(
                         amount_minor=amount_minor_int,
                         currency_num=currency_num,
                         reference=reference,
                         first_wait=25.0,
                         final_wait=180.0,
                         on_phase=_on_phase,
-                    )
+                      )
 
-                    try:
+                      try:
                         sigma.ensure_idle(max_total_wait=10.0)
-                    except Exception:
+                      except Exception:
                         pass
 
 
