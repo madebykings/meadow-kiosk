@@ -19,11 +19,6 @@ Important fix:
 - Sigma can still report STATUS=20 *after* a successful purchase. So we run post-purchase
   ensure_idle() best-effort to clean the terminal for the NEXT customer.
 
-Enhancement (UI support):
-- purchase(..., on_phase=...) emits on_phase("finalising", props) once when Sigma first
-  indicates approval (STATUS=0) but the response is not yet final (TIMEOUT not 0/missing).
-  This lines up with the Sigma "Auth ✅" tick and lets your UI show a "Processing..." state.
-
 PySerial robustness:
 - Some builds/devices throw BrokenPipeError inside serialposix._update_dtr_state() while opening
 - Some pyserial builds do NOT support do_not_open=True
@@ -31,7 +26,7 @@ PySerial robustness:
   with a temporary patch around _update_dtr_state() to ignore errno 32.
 
 Public API:
-- SigmaIppClient.purchase(amount_minor:int, currency_num:str="826", reference:str="", on_phase=callable)
+- SigmaIppClient.purchase(amount_minor:int, currency_num:str="826", reference:str="")
 - SigmaIppClient.get_status_final()
 - SigmaIppClient.ensure_idle()
 
@@ -46,7 +41,7 @@ import time
 import uuid
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List, Callable
+from typing import Any, Dict, Optional, Tuple, List
 
 import serial
 
@@ -306,15 +301,12 @@ class SigmaIppClient:
         first_wait: float,
         final_wait: float,
         log_other: bool = True,
-        on_match: Optional[Callable[[Dict[str, str], bool], None]] = None,  # (props, is_final)
     ) -> Optional[SigmaFrame]:
         """
         Wait for frames matching METHOD+SID.
         - waits for first matching frame up to first_wait
         - if STATUS != 0 returns immediately
         - else continues until final frame (TIMEOUT missing/0) or final_wait
-
-        on_match(props, is_final) is called for each matching frame (best-effort, never raises).
         """
         if not self._ser or not self._ser.is_open:
             self.open()
@@ -332,13 +324,6 @@ class SigmaIppClient:
                 self.log.debug(f"RX(other) {props} RAW={raw!r}")
 
             if props.get("METHOD") == method and props.get("SID") == sid:
-                is_final = _timeout_is_final(props)
-                if on_match:
-                    try:
-                        on_match(props, is_final)
-                    except Exception:
-                        pass
-
                 first = props
                 first_raw = raw
                 self.log.debug(f"RX({method} first) {props} RAW={raw!r}")
@@ -362,17 +347,10 @@ class SigmaIppClient:
                 self.log.debug(f"RX(other) {props} RAW={raw!r}")
 
             if props.get("METHOD") == method and props.get("SID") == sid:
-                is_final = _timeout_is_final(props)
-                if on_match:
-                    try:
-                        on_match(props, is_final)
-                    except Exception:
-                        pass
-
                 last = props
                 last_raw = raw
                 self.log.debug(f"RX({method}) {props} RAW={raw!r}")
-                if is_final:
+                if _timeout_is_final(props):
                     break
 
         return SigmaFrame(props=last, raw_text=last_raw, sid=sid, method=method)
@@ -388,13 +366,7 @@ class SigmaIppClient:
         Send METHOD and wait for its response frames to complete (final TIMEOUT=0/missing).
         """
         sid = self._send_method(method, extra_lines=extra_lines)
-        return self._wait_for_sid(
-            method,
-            sid,
-            first_wait=first_wait,
-            final_wait=final_wait,
-            log_other=True,
-        )
+        return self._wait_for_sid(method, sid, first_wait=first_wait, final_wait=final_wait, log_other=True)
 
     # -----------------------------
     # Status / idle handling
@@ -402,13 +374,7 @@ class SigmaIppClient:
 
     def get_status_final(self, max_wait: float = 6.0) -> Optional[Dict[str, str]]:
         sid = self._send_method("GET_STATUS")
-        frame = self._wait_for_sid(
-            "GET_STATUS",
-            sid,
-            first_wait=max_wait,
-            final_wait=max_wait,
-            log_other=True,
-        )
+        frame = self._wait_for_sid("GET_STATUS", sid, first_wait=max_wait, final_wait=max_wait, log_other=True)
         return frame.props if frame else None
 
     @staticmethod
@@ -479,14 +445,10 @@ class SigmaIppClient:
         reference: str = "",
         first_wait: float = 25.0,
         final_wait: float = 180.0,
-        on_phase: Optional[Callable[[str, Dict[str, str]], None]] = None,
     ) -> Dict[str, Any]:
         """
         PURCHASE using amount in minor units (e.g. 100 for £1.00).
         Returns dict compatible with your existing API expectations.
-
-        on_phase("finalising", props) fires once when we first see an approved (STATUS=0)
-        non-final frame (TIMEOUT not 0/missing). This is your UI "Processing..." window.
         """
         if not self._ser or not self._ser.is_open:
             self.open()
@@ -509,46 +471,7 @@ class SigmaIppClient:
 
         sid = self._send_method("PURCHASE", extra_lines=extra)
 
-        fired_finalising = False
-
-        def _on_purchase_frame(p: Dict[str, str], is_final: bool) -> None:
-            nonlocal fired_finalising
-            if fired_finalising:
-                return
-
-            # Sigma can emit STATUS=0 frames before the customer taps (e.g. "waiting for card").
-            # Only flip UI to "finalising" once auth really happened:
-            #  - typically STAGE >= 5 on your flow, OR
-            #  - we see real auth markers like TXID/RRN/AUTHCODE/etc.
-            stage_str = str(p.get("STAGE") or "")
-            try:
-                stage_i = int(stage_str) if stage_str.isdigit() else -1
-            except Exception:
-                stage_i = -1
-
-            has_auth_markers = bool(
-                (p.get("TXID") or "").strip()
-                or (p.get("RRN") or "").strip()
-                or (p.get("AUTHCODE") or "").strip()
-                or (p.get("APPROVAL") or "").strip()
-            )
-
-            if str(p.get("STATUS") or "") == "0" and (not is_final) and (stage_i >= 5 or has_auth_markers):
-                fired_finalising = True
-                if on_phase:
-                    try:
-                        on_phase("finalising", p)
-                    except Exception:
-                        pass
-
-        frame = self._wait_for_sid(
-            "PURCHASE",
-            sid,
-            first_wait=first_wait,
-            final_wait=final_wait,
-            log_other=True,
-            on_match=_on_purchase_frame,
-        )
+        frame = self._wait_for_sid("PURCHASE", sid, first_wait=first_wait, final_wait=final_wait, log_other=True)
         if not frame:
             raise SigmaTimeout("No PURCHASE response within timeout")
 
@@ -583,17 +506,6 @@ class SigmaIPP:
     def __init__(self, port: str = DEFAULT_PORT, baud: int = DEFAULT_BAUD, version: str = DEFAULT_VERSION):
         self._client = SigmaIppClient(port=port, baudrate=baud, version=version)
 
-    def purchase(
-        self,
-        amount_minor: int,
-        currency_num: str = "826",
-        reference: str = "",
-        on_phase: Optional[Callable[[str, Dict[str, str]], None]] = None,
-    ) -> Dict[str, Any]:
+    def purchase(self, amount_minor: int, currency_num: str = "826", reference: str = "") -> Dict[str, Any]:
         with self._client as c:
-            return c.purchase(
-                amount_minor=amount_minor,
-                currency_num=currency_num,
-                reference=reference,
-                on_phase=on_phase,
-            )
+            return c.purchase(amount_minor=amount_minor, currency_num=currency_num, reference=reference)
