@@ -3,7 +3,6 @@
 
 Fast local endpoints (no WP latency):
   POST /sigma/purchase            { amount_minor:int, currency_num:str|int, reference:str }
-  POST /sigma/warm                { }  (best-effort warmup / ensure_idle; non-blocking if busy)
   POST /vend                      { motor:int }
 
 Admin endpoints (require kiosk_id + key):
@@ -85,7 +84,6 @@ except Exception:
 _SIGMA_THREAD_LOCK = threading.Lock()
 SIGMA_LOCKFILE = os.environ.get("MEADOW_SIGMA_LOCKFILE", "/tmp/meadow_sigma.lock")
 
-SIGMA_WARM_MAX_WAIT_SECS = 8.0      # bounded ensure_idle
 SIGMA_BUSY_LOCK_TIMEOUT = 0.10      # if Sigma busy, warmup returns immediately
 SIGMA_PURCHASE_LOCK_TIMEOUT = 10.0  # seconds to wait for lock before returning "busy"
 
@@ -779,9 +777,6 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/heartbeat"):
             _touch(UI_HEARTBEAT_FILE)
             return _json_response(self, 200, {"ok": True})
-
-        if self.path.startswith("/sigma/warm"):
-            return self._handle_sigma_warm()
 
         if self.path.startswith("/sigma/purchase"):
             return self._handle_sigma_purchase()
