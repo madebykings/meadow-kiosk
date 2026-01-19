@@ -504,17 +504,26 @@ class SigmaIppClient:
         def _on_purchase_frame(p: Dict[str, str], is_final: bool) -> None:
             nonlocal fired_finalising, last_stage_i
 
-            # Parse STAGE safely
-            stage_str = str(p.get("STAGE") or "")
-            try:
-                stage_i = int(stage_str) if stage_str.isdigit() else -1
-            except Exception:
-                stage_i = -1
+            # --- parse TX_STATUS (preferred if present) ---
+            tx_status = str(p.get("TX_STATUS") or p.get("TXSTATUS") or "")
+            tx_i = -1
+            if tx_status.isdigit():
+                tx_i = int(tx_status)
 
-            # Fire "finalising" when we move from tap prompt to card handled
-            # Observed flow: STAGE=11 (tap card) -> STAGE=2 (after tap)
-            if (not fired_finalising) and (not is_final):
-                if stage_i == 2 and last_stage_i in (-1, 0, 1, 11):
+            # --- parse STAGE (fallback) ---
+            stage_str = str(p.get("STAGE") or "")
+            stage_i = -1
+            if stage_str.isdigit():
+                stage_i = int(stage_str)
+
+            # --- FINALISING trigger ---
+            if not fired_finalising and not is_final:
+
+                # ✅ PREFERRED: myPOS host-send moment (tap accepted → authorising)
+                # TX_STATUS:
+                #   2  = SENT2HOST
+                #   14 = GO_ONLINE (EMV decided)
+                if tx_i in (2, 14):
                     fired_finalising = True
                     if on_phase:
                         try:
@@ -522,6 +531,16 @@ class SigmaIppClient:
                         except Exception:
                             pass
 
+                # ✅ FALLBACK: existing STAGE heuristic (11 → 2)
+                elif stage_i == 2 and last_stage_i in (-1, 0, 1, 11):
+                    fired_finalising = True
+                    if on_phase:
+                        try:
+                            on_phase("finalising", p)
+                        except Exception:
+                            pass
+
+            # always update last_stage_i
             last_stage_i = stage_i
 
         frame = self._wait_for_sid(
