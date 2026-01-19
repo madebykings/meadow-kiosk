@@ -11,6 +11,10 @@ Type=simple
 User=meadow
 WorkingDirectory=/home/meadow/meadow-kiosk
 
+# Ensure /run/meadow exists on every start (tmpfs) and is owned by meadow
+RuntimeDirectory=meadow
+RuntimeDirectoryMode=0755
+
 Environment=PYTHONUNBUFFERED=1
 Environment=GIT_TERMINAL_PROMPT=0
 
