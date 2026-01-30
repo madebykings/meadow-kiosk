@@ -1156,10 +1156,12 @@ def main() -> None:
     threading.Thread(target=_config_poll_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
+    # 🛡️ Kiosk self-heal watchdog (UI + Sigma popups)
+    start_watchdog_thread()
+
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[pi_api] listening on http://{HOST}:{PORT}", flush=True)
     httpd.serve_forever()
-
 
 if __name__ == "__main__":
     main()
