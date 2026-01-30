@@ -5,9 +5,9 @@ set -euo pipefail
 # Meadow kiosk-browser.sh
 # ------------------------------------------------------------
 # Launches Chromium in kiosk mode and watches for:
-#   * STOP_FLAG (exit)
-#   * UI heartbeat staleness (restart Chromium)
-#   * WP heartbeat staleness (switch to offline.html)
+# * STOP_FLAG (exit)
+# * UI heartbeat staleness (restart Chromium)
+# * WP heartbeat staleness (switch to offline.html)
 #
 # IMPORTANT PATH RULE:
 # Prefer /run/meadow/* as primary. Fall back to /tmp/* only if /run file missing.
@@ -54,9 +54,22 @@ DAEMON_HEARTBEAT_URL="${MEADOW_DAEMON_HEARTBEAT_URL:-http://127.0.0.1:8765/heart
 # Dedicated Chrome profile (helps stability / avoids weird state)
 CHROME_PROFILE="${MEADOW_CHROME_PROFILE:-${STATE_DIR}/chrome-profile}"
 
-# Wayland (labwc) popup suppression (Sigma restart popup)
-WAYLAND_DISPLAY_NAME="${WAYLAND_DISPLAY:-wayland-0}"
-WAYLAND_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
+# ------------------------------------------------------------
+# ADD: Self-heal settings (safe defaults)
+# ------------------------------------------------------------
+
+# Restart Chromium if the kiosk URL can't be fetched repeatedly
+FETCH_CHECK_ENABLED="${MEADOW_FETCH_CHECK_ENABLED:-1}"   # 1=on, 0=off
+FETCH_FAIL_LIMIT="${MEADOW_FETCH_FAIL_LIMIT:-3}"        # consecutive fails before restart
+FETCH_TIMEOUT_SECS="${MEADOW_FETCH_TIMEOUT_SECS:-2}"    # curl timeout seconds
+
+# Restart Chromium if an "Aw, Snap" crash tab is detected (labwc/Wayland)
+AWSNAP_CHECK_ENABLED="${MEADOW_AWSNAP_CHECK_ENABLED:-1}" # 1=on, 0=off
+AWSNAP_MATCH="${MEADOW_AWSNAP_MATCH:-Aw, Snap}"
+
+# Wayland env defaults (labwc)
+WAYLAND_RUNTIME_DIR="${MEADOW_WAYLAND_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/run/user/1000}}"
+WAYLAND_DISPLAY_NAME="${MEADOW_WAYLAND_DISPLAY:-${WAYLAND_DISPLAY:-wayland-0}}"
 
 log() {
   local msg="$1"
@@ -162,16 +175,28 @@ bridge_ui_heartbeat() {
   fi
 }
 
+# ------------------------------------------------------------
+# ADD: labwc/Wayland popup close + Aw, Snap detection
+# ------------------------------------------------------------
+
 close_sigma_popup_wayland() {
-  # On labwc/Wayland, the Sigma restart popup appears as:
-  #   app_id: pcmanfm
-  #   title:  Error
-  #
-  # We close ONLY that window. No pkill. No wmctrl.
+  # Proven manual close:
+  #   wlrctl toplevel close app_id:pcmanfm title:Error
   if command -v wlrctl >/dev/null 2>&1; then
     XDG_RUNTIME_DIR="$WAYLAND_RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY_NAME" \
       wlrctl toplevel close app_id:pcmanfm title:Error >/dev/null 2>&1 || true
   fi
+}
+
+check_aw_snap_wayland() {
+  if [ "${AWSNAP_CHECK_ENABLED}" != "1" ]; then
+    return 1
+  fi
+  if ! command -v wlrctl >/dev/null 2>&1; then
+    return 1
+  fi
+  XDG_RUNTIME_DIR="$WAYLAND_RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY_NAME" \
+    wlrctl toplevel list 2>/dev/null | grep -iF "${AWSNAP_MATCH}" >/dev/null 2>&1
 }
 
 find_chrome() {
@@ -282,6 +307,9 @@ while true; do
   echo "$CHROME_PID" > "$KIOSK_PIDFILE" 2>/dev/null || true
   START_TS="$(date +%s)"
 
+  # ADD: counters for self-heal fetch checking
+  FETCH_FAILS=0
+
   # Watch loop while chromium is alive
   while kill -0 "$CHROME_PID" 2>/dev/null; do
     if _stop_flag_present; then
@@ -295,8 +323,34 @@ while true; do
 
     bridge_ui_heartbeat
 
-    # Close Sigma restart popup if it appears (labwc/Wayland)
+    # ADD: close Sigma popup on labwc/Wayland (safe no-op if not present)
     close_sigma_popup_wayland
+
+    # ADD: Aw, Snap detection -> restart Chromium
+    if check_aw_snap_wayland; then
+      log "[Meadow] Aw, Snap detected — restarting Chromium"
+      kill "$CHROME_PID" 2>/dev/null || true
+      break
+    fi
+
+    # ADD: short internet drop / wedged load detection -> restart Chromium
+    if [ "${FETCH_CHECK_ENABLED}" = "1" ]; then
+      if [ -n "${URL:-}" ] && [ "${URL}" != "$OFFLINE_URL" ] && [[ "${URL}" != "about:blank"* ]]; then
+        if curl -fsS -m "${FETCH_TIMEOUT_SECS}" -o /dev/null "${URL}" 2>/dev/null; then
+          FETCH_FAILS=0
+        else
+          FETCH_FAILS=$((FETCH_FAILS + 1))
+          log "[Meadow] Fetch failed ${FETCH_FAILS}/${FETCH_FAIL_LIMIT} for ${URL}"
+          if [ "${FETCH_FAILS}" -ge "${FETCH_FAIL_LIMIT}" ]; then
+            log "[Meadow] Fetch failure limit reached — restarting Chromium"
+            kill "$CHROME_PID" 2>/dev/null || true
+            break
+          fi
+        fi
+      else
+        FETCH_FAILS=0
+      fi
+    fi
 
     UI_HB_FILE="$(_pick_primary_or_fallback "$UI_HEARTBEAT_RUN" "$UI_HEARTBEAT_TMP")"
     WP_HB_FILE="$(_pick_primary_or_fallback "$WP_HEARTBEAT_RUN" "$WP_HEARTBEAT_TMP")"
