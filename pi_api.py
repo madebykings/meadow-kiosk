@@ -78,99 +78,7 @@ try:
 except Exception:
     ADMIN_KIOSK_ID_FALLBACK = 0
 
-# -------------------------------------------------------------------
-# Kiosk self-heal watchdog (NO extra systemd service needed)
-# - Fix 1: Recover from short internet drops / Chromium "Aw, Snap" by restarting kiosk browser
-# - Fix 2: Prevent Sigma updater / GUI dialogs from stealing focus (kill dialog processes)
-# -------------------------------------------------------------------
 
-UI_STALE_SECS = int(os.environ.get("MEADOW_UI_STALE_SECS", "15"))
-WATCHDOG_SECS = float(os.environ.get("MEADOW_WATCHDOG_SECS", "2.0"))
-KILL_POPUPS = (os.environ.get("MEADOW_KILL_POPUPS", "1").strip() != "0")
-
-# Add/adjust patterns here as you discover the real culprit on your image
-POPUP_KILL_PATTERNS = [
-    "zenity",
-    "gtkdialog",
-    "yad",
-    "xmessage",
-    "gxmessage",
-    "notify-osd",
-    "lxqt-notificationd",
-]
-
-CHROMIUM_KILL_PATTERNS = [
-    "chromium",
-    "chromium-browser",
-]
-
-def _file_age_seconds(path: str) -> Optional[int]:
-    try:
-        st = os.stat(path)
-        return int(time.time() - st.st_mtime)
-    except Exception:
-        return None
-
-def _run_quiet(cmd: list[str]) -> None:
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    except Exception:
-        pass
-
-def _pkill(pattern: str) -> None:
-    # pkill -f matches full command line; -9 is deliberate for kiosk robustness
-    _run_quiet(["/usr/bin/pkill", "-9", "-f", pattern])
-
-def _restart_kiosk_browser(reason: str) -> None:
-    # Don't restart if STOP_FLAG exists (your own "stop kiosk" mechanism)
-    try:
-        if os.path.exists(STOP_FLAG):
-            return
-    except Exception:
-        pass
-
-    # Kill chromium hard
-    for p in CHROMIUM_KILL_PATTERNS:
-        _pkill(p)
-
-    # Relaunch kiosk browser script (your existing control path)
-    try:
-        subprocess.Popen(
-            ["/bin/bash", "-lc", f"{KIOSK_SCRIPT} >/dev/null 2>&1 &"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
-
-def _watchdog_loop() -> None:
-    # Give boot a moment
-    time.sleep(3)
-
-    while True:
-        try:
-            # 1) Kill popup dialogs so Sigma updates can't steal focus
-            if KILL_POPUPS:
-                for pat in POPUP_KILL_PATTERNS:
-                    _pkill(pat)
-
-            # 2) If UI heartbeat is stale, restart the browser
-            age = _file_age_seconds(UI_HEARTBEAT_FILE)
-            if age is None:
-                # no heartbeat yet; don't thrash early boot
-                pass
-            else:
-                if age > UI_STALE_SECS:
-                    _restart_kiosk_browser(f"ui_heartbeat_stale:{age}s")
-
-        except Exception:
-            pass
-
-        time.sleep(WATCHDOG_SECS)
-
-def start_watchdog_thread() -> None:
-    t = threading.Thread(target=_watchdog_loop, daemon=True, name="meadow_watchdog")
-    t.start()
 
 # -------------------------------------------------------------------
 # Sigma concurrency guard (warmup + purchase share one serial port)
@@ -1156,8 +1064,7 @@ def main() -> None:
     threading.Thread(target=_config_poll_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
-    # 🛡️ Kiosk self-heal watchdog (UI + Sigma popups)
-    start_watchdog_thread()
+
 
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[pi_api] listening on http://{HOST}:{PORT}", flush=True)
