@@ -118,6 +118,12 @@ POPUP_KILL_PATTERNS = [
 ]
 
 def _append_log(path: str, text: str) -> None:
+    # Prefer journald (always available). Also try file if possible.
+    try:
+        print(text, flush=True)
+    except Exception:
+        pass
+
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
