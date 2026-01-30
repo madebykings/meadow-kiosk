@@ -145,6 +145,13 @@ restart_count() {
 }
 
 bridge_ui_heartbeat() {
+  # If split mode is enabled, do NOT fake UI heartbeat (otherwise a frozen UI looks healthy)
+  if [ "${MEADOW_HEARTBEAT_MODE:-legacy}" = "split" ]; then
+    curl -sS -m 1 -o /dev/null -X POST "$DAEMON_HEARTBEAT_URL" 2>/dev/null || true
+    return
+  fi
+
+  # Legacy behaviour (current): curl ping + touch UI heartbeat files
   if curl -sS -m 1 -o /dev/null -X POST "$DAEMON_HEARTBEAT_URL" 2>/dev/null; then
     _touch_best_effort "$UI_HEARTBEAT_RUN"
     _touch_best_effort "$UI_HEARTBEAT_TMP"
