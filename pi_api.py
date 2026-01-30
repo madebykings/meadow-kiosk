@@ -58,8 +58,17 @@ PORT = 8765
 UI_HEARTBEAT_FILE = os.environ.get("MEADOW_UI_HEARTBEAT_FILE", "/tmp/meadow_ui_heartbeat")
 WP_HEARTBEAT_FILE = os.environ.get("MEADOW_WP_HEARTBEAT_FILE", "/tmp/meadow_wp_heartbeat")
 
+# NEW: separate daemon heartbeat file (kiosk-browser curl pings)
+DAEMON_HEARTBEAT_FILE = os.environ.get("MEADOW_DAEMON_HEARTBEAT_FILE", "/run/meadow/daemon_heartbeat")
+
+# Heartbeat mode:
+# - legacy (default): /heartbeat always touches UI_HEARTBEAT_FILE (no behaviour change)
+# - split: curl -> DAEMON_HEARTBEAT_FILE, browser/js -> UI_HEARTBEAT_FILE
+HEARTBEAT_MODE = (os.environ.get("MEADOW_HEARTBEAT_MODE", "legacy") or "legacy").strip().lower()
+
 KIOSK_URL_FILE = os.environ.get("MEADOW_KIOSK_URL_FILE", "/home/meadow/meadow-kiosk/kiosk.url")
 STOP_FLAG = os.environ.get("MEADOW_KIOSK_STOP_FLAG", "/tmp/meadow_kiosk_stop")
+
 
 # Direct kiosk control (no systemd)
 KIOSK_SCRIPT = os.environ.get("MEADOW_KIOSK_SCRIPT", "/home/meadow/meadow-kiosk/kiosk-browser.sh")
@@ -249,6 +258,42 @@ def _touch(path: str) -> None:
             os.utime(path, None)
     except Exception:
         pass
+
+def _looks_like_curl(handler: BaseHTTPRequestHandler) -> bool:
+    ua = (handler.headers.get("User-Agent") or "").lower()
+    return "curl/" in ua
+
+
+# -------------------------------------------------------------------
+# Sigma popup suppression (kills GUI dialogs that steal focus)
+# -------------------------------------------------------------------
+POPUP_KILL_ENABLED = (os.environ.get("MEADOW_KILL_POPUPS", "1").strip() != "0")
+POPUP_KILL_INTERVAL = float(os.environ.get("MEADOW_KILL_POPUP_INTERVAL", "2.0"))
+
+POPUP_KILL_PATTERNS = [
+    "zenity",
+    "gtkdialog",
+    "yad",
+    "xmessage",
+    "gxmessage",
+    "notify-osd",
+    "lxqt-notificationd",
+]
+
+def _popup_killer_loop() -> None:
+    time.sleep(3)
+    while True:
+        try:
+            if POPUP_KILL_ENABLED:
+                for pat in POPUP_KILL_PATTERNS:
+                    subprocess.call(
+                        ["pkill", "-9", "-f", pat],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+        except Exception:
+            pass
+        time.sleep(max(0.5, POPUP_KILL_INTERVAL))
 
 
 def _git_short_hash() -> str:
@@ -750,8 +795,11 @@ class Handler(BaseHTTPRequestHandler):
             return _json_response(self, 200, STATE.snapshot())
 
         if self.path.startswith("/heartbeat"):
+            if HEARTBEAT_MODE == "split" and _looks_like_curl(self):
+                _touch(DAEMON_HEARTBEAT_FILE)
+                return _json_response(self, 200, {"ok": True, "who": "daemon"})
             _touch(UI_HEARTBEAT_FILE)
-            return _json_response(self, 200, {"ok": True})
+            return _json_response(self, 200, {"ok": True, "who": "ui"})
 
         if self.path.startswith("/admin/status"):
             data: Dict[str, Any] = {}
@@ -777,8 +825,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path.startswith("/heartbeat"):
+            if HEARTBEAT_MODE == "split" and _looks_like_curl(self):
+                _touch(DAEMON_HEARTBEAT_FILE)
+                return _json_response(self, 200, {"ok": True, "who": "daemon"})
             _touch(UI_HEARTBEAT_FILE)
-            return _json_response(self, 200, {"ok": True})
+            return _json_response(self, 200, {"ok": True, "who": "ui"})
 
         if self.path.startswith("/sigma/purchase"):
             return self._handle_sigma_purchase()
@@ -1064,7 +1115,8 @@ def main() -> None:
     threading.Thread(target=_config_poll_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
-
+    # Sigma popup suppression
+    threading.Thread(target=_popup_killer_loop, daemon=True).start()
 
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[pi_api] listening on http://{HOST}:{PORT}", flush=True)
