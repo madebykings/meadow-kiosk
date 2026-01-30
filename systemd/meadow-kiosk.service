@@ -28,7 +28,7 @@ Environment=MEADOW_KIOSK_URL_FILE=/home/meadow/meadow-kiosk/kiosk.url
 Environment=MEADOW_OFFLINE_URL=file:///home/meadow/meadow-kiosk/offline.html
 
 Environment=MEADOW_DAEMON_HEARTBEAT_FILE=/run/meadow/daemon_heartbeat
-Environment=MEADOW_HEARTBEAT_MODE=split
+Environment=MEADOW_HEARTBEAT_MODE=legacy
 
 Environment=MEADOW_KIOSK_STOP_FLAG=/run/meadow/kiosk_stop
 Environment=MEADOW_UI_HEARTBEAT_FILE=/run/meadow/ui_heartbeat
