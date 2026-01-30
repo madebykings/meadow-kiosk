@@ -92,7 +92,7 @@ except Exception:
 # -------------------------------------------------------------------
 POPUP_KILL_ENABLED = (os.environ.get("MEADOW_KILL_POPUPS", "1").strip() != "0")
 POPUP_KILL_INTERVAL = float(os.environ.get("MEADOW_KILL_POPUP_INTERVAL", "2.0"))
-POPUP_DEBUG = (os.environ.get("MEADOW_POPUP_DEBUG", "1").strip() != "0")
+POPUP_DEBUG = (os.environ.get("MEADOW_POPUP_DEBUG", "0").strip() != "0")
 POPUP_DEBUG_LOG = os.environ.get("MEADOW_POPUP_DEBUG_LOG", "/run/meadow/popup_debug.log")
 
 # Start broad. We'll tighten once we identify the real process/window.
