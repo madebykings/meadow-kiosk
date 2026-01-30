@@ -164,6 +164,7 @@ def _snapshot_popups() -> None:
         _append_log(POPUP_DEBUG_LOG, f"[ps newest] failed: {e}")
 
 def _popup_killer_loop() -> None:
+    _append_log(POPUP_DEBUG_LOG, "[popup] popup killer thread started")
     time.sleep(3)
     last_snapshot = 0.0
 
