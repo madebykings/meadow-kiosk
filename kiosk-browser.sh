@@ -54,6 +54,10 @@ DAEMON_HEARTBEAT_URL="${MEADOW_DAEMON_HEARTBEAT_URL:-http://127.0.0.1:8765/heart
 # Dedicated Chrome profile (helps stability / avoids weird state)
 CHROME_PROFILE="${MEADOW_CHROME_PROFILE:-${STATE_DIR}/chrome-profile}"
 
+# Wayland (labwc) popup suppression (Sigma restart popup)
+WAYLAND_DISPLAY_NAME="${WAYLAND_DISPLAY:-wayland-0}"
+WAYLAND_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
+
 log() {
   local msg="$1"
   local ts
@@ -155,6 +159,18 @@ bridge_ui_heartbeat() {
   if curl -sS -m 1 -o /dev/null -X POST "$DAEMON_HEARTBEAT_URL" 2>/dev/null; then
     _touch_best_effort "$UI_HEARTBEAT_RUN"
     _touch_best_effort "$UI_HEARTBEAT_TMP"
+  fi
+}
+
+close_sigma_popup_wayland() {
+  # On labwc/Wayland, the Sigma restart popup appears as:
+  #   app_id: pcmanfm
+  #   title:  Error
+  #
+  # We close ONLY that window. No pkill. No wmctrl.
+  if command -v wlrctl >/dev/null 2>&1; then
+    XDG_RUNTIME_DIR="$WAYLAND_RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY_NAME" \
+      wlrctl toplevel close app_id:pcmanfm title:Error >/dev/null 2>&1 || true
   fi
 }
 
@@ -278,6 +294,9 @@ while true; do
     ELAPSED=$((NOW - START_TS))
 
     bridge_ui_heartbeat
+
+    # Close Sigma restart popup if it appears (labwc/Wayland)
+    close_sigma_popup_wayland
 
     UI_HB_FILE="$(_pick_primary_or_fallback "$UI_HEARTBEAT_RUN" "$UI_HEARTBEAT_TMP")"
     WP_HB_FILE="$(_pick_primary_or_fallback "$WP_HEARTBEAT_RUN" "$WP_HEARTBEAT_TMP")"
