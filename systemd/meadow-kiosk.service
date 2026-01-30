@@ -36,9 +36,8 @@ Environment=MEADOW_WP_HEARTBEAT_FILE=/run/meadow/wp_heartbeat
 Environment=MEADOW_KIOSK_PIDFILE=/run/meadow/kiosk_browser.pid
 Environment=MEADOW_RESTART_LOG=/run/meadow/kiosk_restart_times
 
-Environment=MEADOW_KILL_POPUPS=1
+Environment=MEADOW_KILL_POPUPS=0
 Environment=MEADOW_KILL_POPUP_INTERVAL=2
-Environment=MEADOW_POPUP_DEBUG_LOG=/home/meadow/meadow-kiosk/state/popup_debug.log
 
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git fetch --prune origin'
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git reset --hard origin/main'
