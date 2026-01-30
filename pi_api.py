@@ -87,6 +87,108 @@ try:
 except Exception:
     ADMIN_KIOSK_ID_FALLBACK = 0
 
+# -------------------------------------------------------------------
+# Sigma / desktop popup suppression + debug logging
+# -------------------------------------------------------------------
+POPUP_KILL_ENABLED = (os.environ.get("MEADOW_KILL_POPUPS", "1").strip() != "0")
+POPUP_KILL_INTERVAL = float(os.environ.get("MEADOW_KILL_POPUP_INTERVAL", "2.0"))
+POPUP_DEBUG = (os.environ.get("MEADOW_POPUP_DEBUG", "1").strip() != "0")
+POPUP_DEBUG_LOG = os.environ.get("MEADOW_POPUP_DEBUG_LOG", "/run/meadow/popup_debug.log")
+
+# Start broad. We'll tighten once we identify the real process/window.
+POPUP_KILL_PATTERNS = [
+    "zenity",
+    "gtkdialog",
+    "yad",
+    "xmessage",
+    "gxmessage",
+    "notify-osd",
+    "lxqt-notificationd",
+    "pcmanfm",
+    "pcmanfm-qt",
+    "lxqt-policykit",
+    "polkit-gnome-authentication-agent",
+    "policykit",
+    "mypos",
+    "sigma",
+    "ipp",
+    "terminal",
+    "updater",
+    "update",
+]
+
+def _append_log(path: str, text: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+            if not text.endswith("\n"):
+                f.write("\n")
+    except Exception:
+        pass
+
+def _snapshot_popups() -> None:
+    """
+    Runs under the systemd service context (DISPLAY=:0 etc), so it can talk to X
+    even when SSH cannot. Writes window list + newest processes to a log file.
+    """
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    _append_log(POPUP_DEBUG_LOG, f"\n--- popup snapshot {ts} ---")
+
+    # Window list (title + PID). Works if wmctrl is installed.
+    try:
+        out = subprocess.check_output(["/usr/bin/wmctrl", "-lp"], stderr=subprocess.DEVNULL, text=True)
+        _append_log(POPUP_DEBUG_LOG, "[wmctrl -lp]")
+        _append_log(POPUP_DEBUG_LOG, out.strip() or "(no windows)")
+    except Exception as e:
+        _append_log(POPUP_DEBUG_LOG, f"[wmctrl -lp] failed: {e}")
+
+    # Window classes (helps identify the popup by WM_CLASS-like info)
+    try:
+        out = subprocess.check_output(["/usr/bin/wmctrl", "-lx"], stderr=subprocess.DEVNULL, text=True)
+        _append_log(POPUP_DEBUG_LOG, "[wmctrl -lx]")
+        _append_log(POPUP_DEBUG_LOG, out.strip() or "(no windows)")
+    except Exception as e:
+        _append_log(POPUP_DEBUG_LOG, f"[wmctrl -lx] failed: {e}")
+
+    # Newest processes
+    try:
+        out = subprocess.check_output(
+            ["/bin/bash", "-lc", "ps -eo pid,comm,args --sort=-start_time | head -n 35"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        _append_log(POPUP_DEBUG_LOG, "[ps newest]")
+        _append_log(POPUP_DEBUG_LOG, out.strip())
+    except Exception as e:
+        _append_log(POPUP_DEBUG_LOG, f"[ps newest] failed: {e}")
+
+def _popup_killer_loop() -> None:
+    time.sleep(3)
+    last_snapshot = 0.0
+
+    while True:
+        try:
+            if POPUP_KILL_ENABLED:
+                for pat in POPUP_KILL_PATTERNS:
+                    subprocess.call(
+                        ["pkill", "-9", "-f", pat],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+
+            # Write a periodic snapshot so we can identify the popup owner
+            if POPUP_DEBUG:
+                now = time.time()
+                # Snapshot every ~10 seconds (small file, enough to catch popups)
+                if now - last_snapshot > 10:
+                    _snapshot_popups()
+                    last_snapshot = now
+
+        except Exception:
+            pass
+
+        time.sleep(max(0.5, POPUP_KILL_INTERVAL))
 
 
 # -------------------------------------------------------------------
@@ -1115,7 +1217,7 @@ def main() -> None:
     threading.Thread(target=_config_poll_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
-    # Sigma popup suppression
+    # Popup killer + debug logger
     threading.Thread(target=_popup_killer_loop, daemon=True).start()
 
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
