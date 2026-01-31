@@ -1,7 +1,8 @@
 [Unit]
 Description=Meadow Kiosk Freeze Watchdog
-After=graphical.target
-Wants=graphical.target
+After=graphical.target meadow-kiosk.service
+Wants=meadow-kiosk.service
+PartOf=meadow-kiosk.service
 
 [Service]
 Type=simple
