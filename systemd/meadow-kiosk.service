@@ -27,24 +27,11 @@ Environment=MEADOW_STATE_DIR=/home/meadow/meadow-kiosk/state
 Environment=MEADOW_KIOSK_URL_FILE=/home/meadow/meadow-kiosk/kiosk.url
 Environment=MEADOW_OFFLINE_URL=file:///home/meadow/meadow-kiosk/offline.html
 
-Environment=MEADOW_DAEMON_HEARTBEAT_FILE=/run/meadow/daemon_heartbeat
-Environment=MEADOW_HEARTBEAT_MODE=legacy
-
 Environment=MEADOW_KIOSK_STOP_FLAG=/run/meadow/kiosk_stop
 Environment=MEADOW_UI_HEARTBEAT_FILE=/run/meadow/ui_heartbeat
 Environment=MEADOW_WP_HEARTBEAT_FILE=/run/meadow/wp_heartbeat
 Environment=MEADOW_KIOSK_PIDFILE=/run/meadow/kiosk_browser.pid
 Environment=MEADOW_RESTART_LOG=/run/meadow/kiosk_restart_times
-
-Environment=MEADOW_KILL_POPUPS=0
-Environment=MEADOW_KILL_POPUP_INTERVAL=2
-
-Environment=MEADOW_FETCH_CHECK_ENABLED=0
-Environment=MEADOW_AWSNAP_CHECK_ENABLED=1
-
-Environment=MEADOW_WP_HEARTBEAT_MAX_AGE=900
-Environment=MEADOW_UI_HEARTBEAT_MAX_AGE=180
-Environment=MEADOW_HEARTBEAT_GRACE=240
 
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git fetch --prune origin'
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git reset --hard origin/main'
