@@ -59,7 +59,7 @@ CHROME_PROFILE="${MEADOW_CHROME_PROFILE:-${STATE_DIR}/chrome-profile}"
 # ------------------------------------------------------------
 
 # Restart Chromium if the kiosk URL can't be fetched repeatedly
-FETCH_CHECK_ENABLED="${MEADOW_FETCH_CHECK_ENABLED:-1}"   # 1=on, 0=off
+FETCH_CHECK_ENABLED="${MEADOW_FETCH_CHECK_ENABLED:-0}"   # 1=on, 0=off
 FETCH_FAIL_LIMIT="${MEADOW_FETCH_FAIL_LIMIT:-8}"        # consecutive fails before restart
 FETCH_TIMEOUT_SECS="${MEADOW_FETCH_TIMEOUT_SECS:-5}"    # curl timeout seconds
 
