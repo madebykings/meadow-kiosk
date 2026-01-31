@@ -58,17 +58,8 @@ PORT = 8765
 UI_HEARTBEAT_FILE = os.environ.get("MEADOW_UI_HEARTBEAT_FILE", "/tmp/meadow_ui_heartbeat")
 WP_HEARTBEAT_FILE = os.environ.get("MEADOW_WP_HEARTBEAT_FILE", "/tmp/meadow_wp_heartbeat")
 
-# NEW: separate daemon heartbeat file (kiosk-browser curl pings)
-DAEMON_HEARTBEAT_FILE = os.environ.get("MEADOW_DAEMON_HEARTBEAT_FILE", "/run/meadow/daemon_heartbeat")
-
-# Heartbeat mode:
-# - legacy (default): /heartbeat always touches UI_HEARTBEAT_FILE (no behaviour change)
-# - split: curl -> DAEMON_HEARTBEAT_FILE, browser/js -> UI_HEARTBEAT_FILE
-HEARTBEAT_MODE = (os.environ.get("MEADOW_HEARTBEAT_MODE", "legacy") or "legacy").strip().lower()
-
 KIOSK_URL_FILE = os.environ.get("MEADOW_KIOSK_URL_FILE", "/home/meadow/meadow-kiosk/kiosk.url")
 STOP_FLAG = os.environ.get("MEADOW_KIOSK_STOP_FLAG", "/tmp/meadow_kiosk_stop")
-
 
 # Direct kiosk control (no systemd)
 KIOSK_SCRIPT = os.environ.get("MEADOW_KIOSK_SCRIPT", "/home/meadow/meadow-kiosk/kiosk-browser.sh")
@@ -86,117 +77,6 @@ try:
     ADMIN_KIOSK_ID_FALLBACK = int(os.environ.get("MEADOW_ADMIN_KIOSK_ID") or "0")
 except Exception:
     ADMIN_KIOSK_ID_FALLBACK = 0
-
-# -------------------------------------------------------------------
-# Sigma / desktop popup suppression + debug logging
-# -------------------------------------------------------------------
-POPUP_KILL_ENABLED = (os.environ.get("MEADOW_KILL_POPUPS", "1").strip() != "0")
-POPUP_KILL_INTERVAL = float(os.environ.get("MEADOW_KILL_POPUP_INTERVAL", "2.0"))
-POPUP_DEBUG = (os.environ.get("MEADOW_POPUP_DEBUG", "0").strip() != "0")
-POPUP_DEBUG_LOG = os.environ.get("MEADOW_POPUP_DEBUG_LOG", "/run/meadow/popup_debug.log")
-
-# Start broad. We'll tighten once we identify the real process/window.
-POPUP_KILL_PATTERNS = [
-    "zenity",
-    "gtkdialog",
-    "yad",
-    "xmessage",
-    "gxmessage",
-    "notify-osd",
-    "lxqt-notificationd",
-    "pcmanfm",
-    "pcmanfm-qt",
-    "lxqt-policykit",
-    "polkit-gnome-authentication-agent",
-    "policykit",
-    "mypos",
-    "sigma",
-    "ipp",
-    "terminal",
-    "updater",
-    "update",
-]
-
-def _append_log(path: str, text: str) -> None:
-    # Prefer journald (always available). Also try file if possible.
-    try:
-        print(text, flush=True)
-    except Exception:
-        pass
-
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(text)
-            if not text.endswith("\n"):
-                f.write("\n")
-    except Exception:
-        pass
-
-def _snapshot_popups() -> None:
-    """
-    Runs under the systemd service context (DISPLAY=:0 etc), so it can talk to X
-    even when SSH cannot. Writes window list + newest processes to a log file.
-    """
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    _append_log(POPUP_DEBUG_LOG, f"\n--- popup snapshot {ts} ---")
-
-    # Window list (title + PID). Works if wmctrl is installed.
-    try:
-        out = subprocess.check_output(["/usr/bin/wmctrl", "-lp"], stderr=subprocess.DEVNULL, text=True)
-        _append_log(POPUP_DEBUG_LOG, "[wmctrl -lp]")
-        _append_log(POPUP_DEBUG_LOG, out.strip() or "(no windows)")
-    except Exception as e:
-        _append_log(POPUP_DEBUG_LOG, f"[wmctrl -lp] failed: {e}")
-
-    # Window classes (helps identify the popup by WM_CLASS-like info)
-    try:
-        out = subprocess.check_output(["/usr/bin/wmctrl", "-lx"], stderr=subprocess.DEVNULL, text=True)
-        _append_log(POPUP_DEBUG_LOG, "[wmctrl -lx]")
-        _append_log(POPUP_DEBUG_LOG, out.strip() or "(no windows)")
-    except Exception as e:
-        _append_log(POPUP_DEBUG_LOG, f"[wmctrl -lx] failed: {e}")
-
-    # Newest processes
-    try:
-        out = subprocess.check_output(
-            ["/bin/bash", "-lc", "ps -eo pid,comm,args --sort=-start_time | head -n 35"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        _append_log(POPUP_DEBUG_LOG, "[ps newest]")
-        _append_log(POPUP_DEBUG_LOG, out.strip())
-    except Exception as e:
-        _append_log(POPUP_DEBUG_LOG, f"[ps newest] failed: {e}")
-
-def _popup_killer_loop() -> None:
-    _append_log(POPUP_DEBUG_LOG, "[popup] popup killer thread started")
-    time.sleep(3)
-    last_snapshot = 0.0
-
-    while True:
-        try:
-            if POPUP_KILL_ENABLED:
-                for pat in POPUP_KILL_PATTERNS:
-                    subprocess.call(
-                        ["pkill", "-9", "-f", pat],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-
-            # Write a periodic snapshot so we can identify the popup owner
-            if POPUP_DEBUG:
-                now = time.time()
-                # Snapshot every ~10 seconds (small file, enough to catch popups)
-                if now - last_snapshot > 10:
-                    _snapshot_popups()
-                    last_snapshot = now
-
-        except Exception:
-            pass
-
-        time.sleep(max(0.5, POPUP_KILL_INTERVAL))
-
 
 # -------------------------------------------------------------------
 # Sigma concurrency guard (warmup + purchase share one serial port)
@@ -367,42 +247,6 @@ def _touch(path: str) -> None:
             os.utime(path, None)
     except Exception:
         pass
-
-def _looks_like_curl(handler: BaseHTTPRequestHandler) -> bool:
-    ua = (handler.headers.get("User-Agent") or "").lower()
-    return "curl/" in ua
-
-
-# -------------------------------------------------------------------
-# Sigma popup suppression (kills GUI dialogs that steal focus)
-# -------------------------------------------------------------------
-POPUP_KILL_ENABLED = (os.environ.get("MEADOW_KILL_POPUPS", "1").strip() != "0")
-POPUP_KILL_INTERVAL = float(os.environ.get("MEADOW_KILL_POPUP_INTERVAL", "2.0"))
-
-POPUP_KILL_PATTERNS = [
-    "zenity",
-    "gtkdialog",
-    "yad",
-    "xmessage",
-    "gxmessage",
-    "notify-osd",
-    "lxqt-notificationd",
-]
-
-def _popup_killer_loop() -> None:
-    time.sleep(3)
-    while True:
-        try:
-            if POPUP_KILL_ENABLED:
-                for pat in POPUP_KILL_PATTERNS:
-                    subprocess.call(
-                        ["pkill", "-9", "-f", pat],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-        except Exception:
-            pass
-        time.sleep(max(0.5, POPUP_KILL_INTERVAL))
 
 
 def _git_short_hash() -> str:
@@ -904,11 +748,8 @@ class Handler(BaseHTTPRequestHandler):
             return _json_response(self, 200, STATE.snapshot())
 
         if self.path.startswith("/heartbeat"):
-            if HEARTBEAT_MODE == "split" and _looks_like_curl(self):
-                _touch(DAEMON_HEARTBEAT_FILE)
-                return _json_response(self, 200, {"ok": True, "who": "daemon"})
             _touch(UI_HEARTBEAT_FILE)
-            return _json_response(self, 200, {"ok": True, "who": "ui"})
+            return _json_response(self, 200, {"ok": True})
 
         if self.path.startswith("/admin/status"):
             data: Dict[str, Any] = {}
@@ -934,11 +775,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path.startswith("/heartbeat"):
-            if HEARTBEAT_MODE == "split" and _looks_like_curl(self):
-                _touch(DAEMON_HEARTBEAT_FILE)
-                return _json_response(self, 200, {"ok": True, "who": "daemon"})
             _touch(UI_HEARTBEAT_FILE)
-            return _json_response(self, 200, {"ok": True, "who": "ui"})
+            return _json_response(self, 200, {"ok": True})
 
         if self.path.startswith("/sigma/purchase"):
             return self._handle_sigma_purchase()
@@ -1224,12 +1062,10 @@ def main() -> None:
     threading.Thread(target=_config_poll_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
-    # Popup killer + debug logger
-    threading.Thread(target=_popup_killer_loop, daemon=True).start()
-
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[pi_api] listening on http://{HOST}:{PORT}", flush=True)
     httpd.serve_forever()
+
 
 if __name__ == "__main__":
     main()
