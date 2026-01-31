@@ -1,5 +1,5 @@
 [Unit]
-Description=Meadow Kiosk Freeze Watchdog
+Description=Meadow Kiosk Freeze Watchdog (restart Chromium if screen frozen)
 After=graphical.target meadow-kiosk.service
 Wants=meadow-kiosk.service
 PartOf=meadow-kiosk.service
@@ -10,8 +10,16 @@ User=root
 Restart=always
 RestartSec=5
 
-ExecStart=/home/meadow/meadow-kiosk/kiosk-freeze-watchdog.sh
+# You can override these via systemd drop-in if needed
+Environment=MEADOW_WD_INTERVAL=17
+Environment=MEADOW_WD_JITTER=3
+Environment=MEADOW_WD_WINDOW=180
+Environment=MEADOW_WD_MIN_UNIQUE=2
+Environment=MEADOW_WD_COOLDOWN=30
+Environment=MEADOW_WD_RATE_WINDOW=3600
+Environment=MEADOW_WD_MAX_RESTARTS=3
 
+ExecStart=/home/meadow/meadow-kiosk/kiosk-freeze-watchdog.sh
 StandardOutput=journal
 StandardError=journal
 
