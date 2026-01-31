@@ -1,0 +1,18 @@
+[Unit]
+Description=Meadow Kiosk Freeze Watchdog
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=5
+
+ExecStart=/home/meadow/meadow-kiosk/kiosk-freeze-watchdog.sh
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
