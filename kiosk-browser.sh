@@ -367,13 +367,11 @@ while true; do
       fi
     fi
 
-    # WP watchdog: if stale and not already offline, restart to switch URL
-    if [ -n "$WP_HB_FILE" ] && [ "$ELAPSED" -gt "$HEARTBEAT_GRACE" ] && [ "$URL" != "$OFFLINE_URL" ]; then
+    # WP watchdog: advisory only (do NOT force offline — can pause during vend flow)
+    if [ -n "$WP_HB_FILE" ] && [ "${ELAPSED:-0}" -gt "${HEARTBEAT_GRACE:-0}" ] && [ "$URL" != "$OFFLINE_URL" ]; then
       WP_AGE="$(_age_of_file "$WP_HB_FILE")"
       if [ "$WP_AGE" -gt "$WP_HEARTBEAT_MAX_AGE" ]; then
-        log "[Meadow] WP heartbeat stale (${WP_AGE}s) — switching to offline screen"
-        kill "$CHROME_PID" 2>/dev/null || true
-        break
+        log "[Meadow] WP heartbeat stale (${WP_AGE}s) — advisory only (not switching offline)"
       fi
     fi
 
