@@ -60,8 +60,10 @@ CHROME_PROFILE="${MEADOW_CHROME_PROFILE:-${STATE_DIR}/chrome-profile}"
 
 # Restart Chromium if the kiosk URL can't be fetched repeatedly
 FETCH_CHECK_ENABLED="${MEADOW_FETCH_CHECK_ENABLED:-1}"   # 1=on, 0=off
-FETCH_FAIL_LIMIT="${MEADOW_FETCH_FAIL_LIMIT:-3}"        # consecutive fails before restart
-FETCH_TIMEOUT_SECS="${MEADOW_FETCH_TIMEOUT_SECS:-2}"    # curl timeout seconds
+FETCH_FAIL_LIMIT="${MEADOW_FETCH_FAIL_LIMIT:-8}"        # consecutive fails before restart
+FETCH_TIMEOUT_SECS="${MEADOW_FETCH_TIMEOUT_SECS:-5}"    # curl timeout seconds
+
+FETCH_URL="${MEADOW_FETCH_URL:-https://meadowvending.com/}"
 
 # Restart Chromium if an "Aw, Snap" crash tab is detected (labwc/Wayland)
 AWSNAP_CHECK_ENABLED="${MEADOW_AWSNAP_CHECK_ENABLED:-1}" # 1=on, 0=off
@@ -336,7 +338,7 @@ while true; do
     # ADD: short internet drop / wedged load detection -> restart Chromium
     if [ "${FETCH_CHECK_ENABLED}" = "1" ]; then
       if [ -n "${URL:-}" ] && [ "${URL}" != "$OFFLINE_URL" ] && [[ "${URL}" != "about:blank"* ]]; then
-        if curl -fsS -m "${FETCH_TIMEOUT_SECS}" -o /dev/null "${URL}" 2>/dev/null; then
+        if curl -fsS -m "${FETCH_TIMEOUT_SECS}" -o /dev/null "${FETCH_URL}" 2>/dev/null; then
           FETCH_FAILS=0
         else
           FETCH_FAILS=$((FETCH_FAILS + 1))
@@ -384,10 +386,18 @@ while true; do
   touch_restart
   CNT="$(restart_count)"
   if [ "$CNT" -gt "$MAX_RESTARTS_IN_WINDOW" ]; then
-    log "[Meadow] Too many restarts (${CNT} in ${RESTART_WINDOW_SECS}s) — stopping kiosk"
-    echo "$(date -Is 2>/dev/null || date)" > "$STOP_FLAG_RUN" 2>/dev/null || true
-    echo "$(date -Is 2>/dev/null || date)" > "$STOP_FLAG_TMP" 2>/dev/null || true
-    exit 0
+    log "[Meadow] Too many restarts (${CNT} in ${RESTART_WINDOW_SECS}s) — cooling down (not stopping kiosk)"
+    # Cooldown instead of writing STOP_FLAG (which drops to desktop)
+    sleep 60
+
+    # Reset restart history so we can recover cleanly after a flap
+    : > "$RESTART_LOG" 2>/dev/null || true
+
+    # Reset backoff to something sensible
+    BACKOFF="$BACKOFF_MAX"
+
+    # Continue loop (will attempt relaunch after cooldown/backoff)
+    continue
   fi
 
   log "[Meadow] Chromium exited — backoff ${BACKOFF}s (restart count ${CNT}/${MAX_RESTARTS_IN_WINDOW})"
