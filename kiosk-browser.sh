@@ -336,13 +336,13 @@ while true; do
     fi
 
     # ADD: short internet drop / wedged load detection -> restart Chromium
-    if [ "${FETCH_CHECK_ENABLED}" = "1" ]; then
+    if [ "${FETCH_CHECK_ENABLED}" = "1" ] && [ "${ELAPSED:-999}" -gt "${HEARTBEAT_GRACE:-0}" ]; then
       if [ -n "${URL:-}" ] && [ "${URL}" != "$OFFLINE_URL" ] && [[ "${URL}" != "about:blank"* ]]; then
         if curl -fsS -m "${FETCH_TIMEOUT_SECS}" -o /dev/null "${FETCH_URL}" 2>/dev/null; then
           FETCH_FAILS=0
         else
           FETCH_FAILS=$((FETCH_FAILS + 1))
-          log "[Meadow] Fetch failed ${FETCH_FAILS}/${FETCH_FAIL_LIMIT} for ${URL}"
+          log "[Meadow] Fetch failed ${FETCH_FAILS}/${FETCH_FAIL_LIMIT} for ${FETCH_URL}"
           if [ "${FETCH_FAILS}" -ge "${FETCH_FAIL_LIMIT}" ]; then
             log "[Meadow] Fetch failure limit reached — restarting Chromium"
             kill "$CHROME_PID" 2>/dev/null || true
@@ -392,6 +392,8 @@ while true; do
 
     # Reset restart history so we can recover cleanly after a flap
     : > "$RESTART_LOG" 2>/dev/null || true
+
+    rm -f "$STOP_FLAG_RUN" "$STOP_FLAG_TMP" 2>/dev/null || true
 
     # Reset backoff to something sensible
     BACKOFF="$BACKOFF_MAX"
