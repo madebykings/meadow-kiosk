@@ -232,6 +232,38 @@ Exec=/usr/bin/xbindkeys -f /home/meadow/.xbindkeysrc
 X-GNOME-Autostart-enabled=true
 EOF
 
+# ------------------------------------------------------------
+# labwc: hide cursor for touchscreen kiosk (Wayland-safe)
+# ------------------------------------------------------------
+
+LABWC_DIR="/home/meadow/.config/labwc"
+LABWC_RC="$LABWC_DIR/rc.xml"
+
+mkdir -p "$LABWC_DIR"
+chown -R meadow:meadow "$LABWC_DIR"
+
+# Create rc.xml if missing (do NOT overwrite)
+if [ ! -f "$LABWC_RC" ]; then
+  cat > "$LABWC_RC" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<labwc_config>
+</labwc_config>
+EOF
+  chown meadow:meadow "$LABWC_RC"
+fi
+
+# Ensure cursor is hidden (idempotent)
+if ! grep -q "<mouse>" "$LABWC_RC"; then
+  sed -i '/<\/labwc_config>/ i\
+  <mouse>\n\
+    <hideCursor>true</hideCursor>\n\
+    <hideCursorDelay>0</hideCursorDelay>\n\
+  </mouse>' "$LABWC_RC"
+else
+  sed -i 's/<hideCursor>.*<\/hideCursor>/<hideCursor>true<\/hideCursor>/' "$LABWC_RC"
+  sed -i 's/<hideCursorDelay>.*<\/hideCursorDelay>/<hideCursorDelay>0<\/hideCursorDelay>/' "$LABWC_RC"
+fi
+
 echo "=== Install systemd service (Pi API) ==="
 sudo install -m 644 "${TARGET_DIR}/systemd/meadow-kiosk.service" /etc/systemd/system/meadow-kiosk.service
 sudo systemctl daemon-reload
