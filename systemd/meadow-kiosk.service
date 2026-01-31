@@ -39,6 +39,13 @@ Environment=MEADOW_RESTART_LOG=/run/meadow/kiosk_restart_times
 Environment=MEADOW_KILL_POPUPS=0
 Environment=MEADOW_KILL_POPUP_INTERVAL=2
 
+Environment=MEADOW_FETCH_CHECK_ENABLED=0
+Environment=MEADOW_AWSNAP_CHECK_ENABLED=1
+
+Environment=MEADOW_WP_HEARTBEAT_MAX_AGE=900
+Environment=MEADOW_UI_HEARTBEAT_MAX_AGE=180
+Environment=MEADOW_HEARTBEAT_GRACE=240
+
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git fetch --prune origin'
 ExecStartPre=/bin/bash -lc 'cd /home/meadow/meadow-kiosk && git reset --hard origin/main'
 ExecStart=/usr/bin/python3 /home/meadow/meadow-kiosk/pi_api.py
