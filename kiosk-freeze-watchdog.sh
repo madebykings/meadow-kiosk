@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+LOG="/run/meadow/freeze-watchdog.log"
+mkdir -p /run/meadow
+exec >>"$LOG" 2>&1
+echo "$(date -Is) [WATCHDOG] start pid=$$"
+
 # Tuned for Meadow: ads rotate every ~10s, videos mean screen should change frequently.
 INTERVAL="${MEADOW_WD_INTERVAL:-17}"      # seconds between samples (avoid 10s alignment)
 JITTER="${MEADOW_WD_JITTER:-3}"           # random 0..JITTER added to interval
