@@ -47,14 +47,16 @@ while true; do
   fi
 
   # Take screenshot to tmpfs, hash, delete (no disk bloat)
-  if ! XDG_RUNTIME_DIR=/run/user/1000 grim /run/meadow_screen.png 2>>/run/meadow/grim.err; then
-  echo "$(date -Is) [WATCHDOG] grim failed; waiting (see /run/meadow/grim.err)"
-  sleep "$INTERVAL"
-  continue
+  SCREEN="/run/meadow/meadow_screen.png"
+
+  if ! XDG_RUNTIME_DIR=/run/user/1000 grim "$SCREEN" 2>/dev/null; then
+    echo "$(date -Is) [WATCHDOG] grim failed; waiting"
+    sleep "$INTERVAL"
+    continue
   fi
 
-  CUR="$(sha256sum /run/meadow_screen.png | awk '{print $1}')"
-  rm -f /run/meadow_screen.png
+  CUR="$(sha256sum "$SCREEN" | awk '{print $1}')"
+  rm -f "$SCREEN"
 
   RING[$IDX]="$CUR"
   IDX=$(( (IDX + 1) % SAMPLES ))
