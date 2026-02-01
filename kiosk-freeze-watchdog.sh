@@ -6,7 +6,7 @@ echo "$(date -Is) [WATCHDOG] start pid=$$"
 # Tuned for Meadow: ads rotate every ~10s, videos mean screen should change frequently.
 INTERVAL="${MEADOW_WD_INTERVAL:-17}"      # seconds between samples (avoid 10s alignment)
 JITTER="${MEADOW_WD_JITTER:-3}"           # random 0..JITTER added to interval
-WINDOW="${MEADOW_WD_WINDOW:-180}"         # seconds in decision window (3 min)
+WINDOW="${MEADOW_WD_WINDOW:-180}"         # seconds in decision window
 MIN_UNIQUE="${MEADOW_WD_MIN_UNIQUE:-2}"   # must see at least 2 distinct frames in WINDOW
 COOLDOWN="${MEADOW_WD_COOLDOWN:-30}"      # seconds to chill after a restart
 
@@ -22,12 +22,12 @@ IDX=0
 FILLED=0
 
 mkdir -p /run/meadow 2>/dev/null || true
+SCREEN="/run/meadow/meadow_screen.png"
 
 rate_touch() {
   local now
   now="$(date +%s)"
   echo "$now" >> "$RATE_LOG" 2>/dev/null || true
-  # keep only within window
   awk -v now="$now" -v win="$RATE_WINDOW" 'now-$1 <= win {print $1}' "$RATE_LOG" > "${RATE_LOG}.tmp" 2>/dev/null || true
   mv -f "${RATE_LOG}.tmp" "$RATE_LOG" 2>/dev/null || true
 }
@@ -39,17 +39,15 @@ rate_count() {
 
 while true; do
   # Only act if kiosk Chromium is actually running
-    if ! pgrep -f "chromium.*--kiosk" >/dev/null; then
+  if ! pgrep -f "chromium.*--kiosk" >/dev/null; then
     RING=(); IDX=0; FILLED=0
     echo "$(date -Is) [WATCHDOG] chromium kiosk not running; waiting"
     sleep "$INTERVAL"
     continue
   fi
 
-  # Take screenshot to tmpfs, hash, delete (no disk bloat)
-  SCREEN="/run/meadow/meadow_screen.png"
-
-  if ! XDG_RUNTIME_DIR=/run/user/1000 grim "$SCREEN" 2>/dev/null; then
+  # Take screenshot, hash, delete (no disk bloat)
+  if ! grim "$SCREEN" >/dev/null 2>&1; then
     echo "$(date -Is) [WATCHDOG] grim failed; waiting"
     sleep "$INTERVAL"
     continue
@@ -81,13 +79,13 @@ while true; do
       continue
     fi
   fi
-  
+
   chrome_pid='?'
   if [ -r /run/meadow/kiosk_browser.pid ]; then
     chrome_pid="$(cat /run/meadow/kiosk_browser.pid 2>/dev/null || true)"
     [ -n "$chrome_pid" ] || chrome_pid='?'
   fi
-  echo "$(date -Is) [WATCHDOG] tick chrome_pid=$chrome_pid"
 
+  echo "$(date -Is) [WATCHDOG] tick chrome_pid=$chrome_pid filled=$FILLED/$SAMPLES"
   sleep $(( INTERVAL + (RANDOM % (JITTER+1)) ))
 done
