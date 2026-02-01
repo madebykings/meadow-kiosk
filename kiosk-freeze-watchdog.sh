@@ -80,7 +80,7 @@ while true; do
     fi
   fi
   
-  echo "$(date -Is) [WATCHDOG] tick   chrome_pid='?'
+  chrome_pid='?'
   if [ -r /run/meadow/kiosk_browser.pid ]; then
     chrome_pid="$(cat /run/meadow/kiosk_browser.pid 2>/dev/null || true)"
     [ -n "$chrome_pid" ] || chrome_pid='?'
