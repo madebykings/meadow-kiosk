@@ -30,7 +30,8 @@ sudo apt install -y \
   xbindkeys \
   xdotool \
   dbus-x11 \
-  modemmanager
+  modemmanager \
+  grim
 
 echo "=== Pi 5 EEPROM auto-boot sanity check (WAIT_FOR_POWER_BUTTON / POWER_OFF_ON_HALT) ==="
 # Do NOT auto-edit EEPROM in an installer (interactive + can brick if mis-edited).
@@ -127,7 +128,9 @@ sudo chmod 755 \
   "${TARGET_DIR}/kiosk-browser.sh" \
   "${TARGET_DIR}/enter-kiosk.sh" \
   "${TARGET_DIR}/exit-kiosk.sh" \
-  "${TARGET_DIR}/update-meadow.sh" 2>/dev/null || true
+  "${TARGET_DIR}/update-meadow.sh" \
+  "${TARGET_DIR}/kiosk-freeze-watchdog.sh" \
+  2>/dev/null || true
 
 # offline.html should be readable
 sudo chmod 644 "${TARGET_DIR}/offline.html" 2>/dev/null || true
@@ -269,6 +272,12 @@ sudo install -m 644 "${TARGET_DIR}/systemd/meadow-kiosk.service" /etc/systemd/sy
 sudo systemctl daemon-reload
 sudo systemctl enable meadow-kiosk.service
 sudo systemctl restart meadow-kiosk.service
+
+echo "=== Install systemd service (Freeze Watchdog) ==="
+sudo install -m 644 "${TARGET_DIR}/systemd/meadow-kiosk-freeze-watchdog.service" /etc/systemd/system/meadow-kiosk-freeze-watchdog.service
+sudo systemctl daemon-reload
+sudo systemctl enable meadow-kiosk-freeze-watchdog.service
+sudo systemctl restart meadow-kiosk-freeze-watchdog.service
 
 echo ""
 echo "=== Pi 5 power note (GPIO 5V header) ==="
