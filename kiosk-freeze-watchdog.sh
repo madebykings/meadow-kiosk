@@ -57,12 +57,11 @@ while true; do
   [ "$FILLED" -lt "$SAMPLES" ] && FILLED=$((FILLED + 1))
 
   if [ "$FILLED" -eq "$SAMPLES" ]; then
-    UNIQUE=$(printf "%s\n" "${RING[@]}" | sort -u | wc -l | tr -d ' ')
+    UNIQUE="$(printf "%s\n" "${RING[@]}" | sort -u | wc -l | tr -d ' ')"
     if [ "$UNIQUE" -lt "$MIN_UNIQUE" ]; then
       CNT="$(rate_count)"
       if [ "$CNT" -ge "$MAX_RESTARTS" ]; then
         echo "$(date -Is) [WATCHDOG] Frozen but rate-limited (${CNT}/${MAX_RESTARTS} in ${RATE_WINDOW}s) — not restarting"
-        # reset window so we don't spam the same decision
         RING=(); IDX=0; FILLED=0
         sleep "$COOLDOWN"
         continue
