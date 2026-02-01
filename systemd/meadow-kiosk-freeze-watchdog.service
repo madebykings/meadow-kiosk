@@ -3,6 +3,8 @@ Description=Meadow Kiosk Freeze Watchdog (restart Chromium if screen frozen)
 After=graphical.target meadow-kiosk.service
 Wants=meadow-kiosk.service
 PartOf=meadow-kiosk.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
