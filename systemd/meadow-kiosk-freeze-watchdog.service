@@ -10,6 +10,7 @@ StartLimitBurst=5
 Type=simple
 User=meadow
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
 Restart=always
 RestartSec=5
 
