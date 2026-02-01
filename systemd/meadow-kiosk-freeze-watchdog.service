@@ -1,19 +1,24 @@
+# /etc/systemd/system/meadow-kiosk-freeze-watchdog.service
 [Unit]
 Description=Meadow Kiosk Freeze Watchdog (restart Chromium if screen frozen)
-After=graphical.target
-Wants=graphical.target
+After=multi-user.target
+Wants=multi-user.target
+
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 User=meadow
 WorkingDirectory=/home/meadow/meadow-kiosk
 
-RuntimeDirectory=meadow
-RuntimeDirectoryMode=0775
+# Ensure /run/meadow exists on every start (tmpfs) and is writable by meadow
+ExecStartPre=/bin/bash -lc 'mkdir -p /run/meadow && chown meadow:meadow /run/meadow && chmod 0775 /run/meadow'
 
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=WAYLAND_DISPLAY=wayland-0
 
+# You can override these via systemd drop-in if needed
 Environment=MEADOW_WD_INTERVAL=17
 Environment=MEADOW_WD_JITTER=3
 Environment=MEADOW_WD_WINDOW=180
