@@ -44,7 +44,7 @@ while true; do
   fi
 
   # Take screenshot to tmpfs, hash, delete (no disk bloat)
-  if ! sudo -u meadow XDG_RUNTIME_DIR=/run/user/1000 grim /run/meadow_screen.png 2>/dev/null; then
+  if ! XDG_RUNTIME_DIR=/run/user/1000 grim /run/meadow_screen.png 2>/dev/null; then
     sleep "$INTERVAL"
     continue
   fi
