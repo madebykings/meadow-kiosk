@@ -47,10 +47,10 @@ while true; do
   fi
 
   # Take screenshot to tmpfs, hash, delete (no disk bloat)
-  if ! XDG_RUNTIME_DIR=/run/user/1000 grim /run/meadow_screen.png 2>/dev/null; then
-    echo "$(date -Is) [WATCHDOG] grim failed; waiting"
-    sleep "$INTERVAL"
-    continue
+  if ! XDG_RUNTIME_DIR=/run/user/1000 grim /run/meadow_screen.png 2>>/run/meadow/grim.err; then
+  echo "$(date -Is) [WATCHDOG] grim failed; waiting (see /run/meadow/grim.err)"
+  sleep "$INTERVAL"
+  continue
   fi
 
   CUR="$(sha256sum /run/meadow_screen.png | awk '{print $1}')"
