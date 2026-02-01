@@ -154,6 +154,9 @@ while true; do
   "$CHROME_BIN" \
     --no-sandbox \
     --disable-dev-shm-usage \
+    --disable-gpu \
+    --disable-gpu-compositing \
+    --disable-software-rasterizer \
     --kiosk \
     --noerrdialogs \
     --disable-infobars \
