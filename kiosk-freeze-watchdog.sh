@@ -80,6 +80,8 @@ while true; do
       continue
     fi
   fi
+  
+  echo "$(date -Is) [WATCHDOG] tick chrome_pid=$(cat /run/meadow/kiosk_browser.pid 2>/dev/null || echo '?')"
 
   sleep $(( INTERVAL + (RANDOM % (JITTER+1)) ))
 done
