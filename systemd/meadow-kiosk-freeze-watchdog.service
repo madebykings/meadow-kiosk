@@ -19,7 +19,9 @@ Environment=MEADOW_WD_COOLDOWN=30
 Environment=MEADOW_WD_RATE_WINDOW=3600
 Environment=MEADOW_WD_MAX_RESTARTS=3
 
-ExecStart=/home/meadow/meadow-kiosk/kiosk-freeze-watchdog.sh
+# IMPORTANT: run via bash to avoid exec permission/noexec issues
+ExecStart=/bin/bash /home/meadow/meadow-kiosk/kiosk-freeze-watchdog.sh
+
 StandardOutput=journal
 StandardError=journal
 
