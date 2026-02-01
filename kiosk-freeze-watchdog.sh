@@ -39,14 +39,16 @@ rate_count() {
 
 while true; do
   # Only act if kiosk Chromium is actually running
-  if ! pgrep -f "chromium.*--kiosk" >/dev/null; then
+    if ! pgrep -f "chromium.*--kiosk" >/dev/null; then
     RING=(); IDX=0; FILLED=0
+    echo "$(date -Is) [WATCHDOG] chromium kiosk not running; waiting"
     sleep "$INTERVAL"
     continue
   fi
 
   # Take screenshot to tmpfs, hash, delete (no disk bloat)
   if ! XDG_RUNTIME_DIR=/run/user/1000 grim /run/meadow_screen.png 2>/dev/null; then
+    echo "$(date -Is) [WATCHDOG] grim failed; waiting"
     sleep "$INTERVAL"
     continue
   fi
@@ -78,7 +80,12 @@ while true; do
     fi
   fi
   
-  echo "$(date -Is) [WATCHDOG] tick chrome_pid=$(cat /run/meadow/kiosk_browser.pid 2>/dev/null || echo '?')"
+  echo "$(date -Is) [WATCHDOG] tick   chrome_pid='?'
+  if [ -r /run/meadow/kiosk_browser.pid ]; then
+    chrome_pid="$(cat /run/meadow/kiosk_browser.pid 2>/dev/null || true)"
+    [ -n "$chrome_pid" ] || chrome_pid='?'
+  fi
+  echo "$(date -Is) [WATCHDOG] tick chrome_pid=$chrome_pid"
 
   sleep $(( INTERVAL + (RANDOM % (JITTER+1)) ))
 done
