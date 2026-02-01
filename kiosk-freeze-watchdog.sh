@@ -21,7 +21,11 @@ declare -a RING=()
 IDX=0
 FILLED=0
 
+# Ensure runtime dir is usable even if created root-owned at boot
 mkdir -p /run/meadow 2>/dev/null || true
+chmod 0775 /run/meadow 2>/dev/null || true
+chown meadow:meadow /run/meadow 2>/dev/null || true
+
 SCREEN="/run/meadow/meadow_screen.png"
 
 rate_touch() {
