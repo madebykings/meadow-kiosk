@@ -277,7 +277,7 @@ echo "=== Install systemd service (Freeze Watchdog) ==="
 sudo install -m 644 "${TARGET_DIR}/systemd/meadow-kiosk-freeze-watchdog.service" /etc/systemd/system/meadow-kiosk-freeze-watchdog.service
 sudo systemctl daemon-reload
 sudo systemctl enable meadow-kiosk-freeze-watchdog.service
-sudo systemctl restart meadow-kiosk-freeze-watchdog.service
+sudo systemctl start meadow-kiosk-freeze-watchdog.service
 
 echo ""
 echo "=== Pi 5 power note (GPIO 5V header) ==="
