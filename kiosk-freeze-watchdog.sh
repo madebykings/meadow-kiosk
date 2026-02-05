@@ -15,6 +15,16 @@ RATE_WINDOW="${MEADOW_WD_RATE_WINDOW:-3600}"
 MAX_RESTARTS="${MEADOW_WD_MAX_RESTARTS:-3}"
 RATE_LOG="${MEADOW_WD_RATE_LOG:-/run/meadow/watchdog_restart_times}"
 
+# -----------------------------
+# Network self-heal (Pi 5 / NetworkManager)
+# -----------------------------
+NET_FAIL_LIMIT="${MEADOW_NET_FAIL_LIMIT:-4}"     # consecutive failures before recovery
+NET_COOLDOWN="${MEADOW_NET_COOLDOWN:-120}"       # seconds between recovery actions
+NET_FAILS=0
+NET_LAST_ACTION=0
+
+ENTER_KIOSK="${MEADOW_ENTER_KIOSK:-/home/meadow/meadow-kiosk/enter-kiosk.sh}"
+
 SAMPLES=$(( (WINDOW + INTERVAL - 1) / INTERVAL ))
 
 declare -a RING=()
@@ -41,7 +51,78 @@ rate_count() {
   wc -l < "$RATE_LOG" 2>/dev/null | tr -d ' '
 }
 
+has_outbound() {
+  # IP + DNS: both must succeed
+  ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || return 1
+  ping -c 1 -W 2 google.com >/dev/null 2>&1 || return 1
+  return 0
+}
+
+net_cooldown_ok() {
+  local now
+  now="$(date +%s)"
+  [ $((now - NET_LAST_ACTION)) -ge "$NET_COOLDOWN" ]
+}
+
+recover_network() {
+  NET_LAST_ACTION="$(date +%s)"
+  echo "$(date -Is) [WATCHDOG] Network recovery starting (cloudflared -> NM bounce if needed -> restart services -> enter kiosk)"
+
+  # 1) low-impact first: restart cloudflared (fixes CF 1033 when wedged)
+  systemctl restart cloudflared >/dev/null 2>&1 || true
+  sleep 6
+
+  # 2) if still no outbound, bounce NetworkManager networking
+  if ! has_outbound; then
+    if systemctl is-active --quiet NetworkManager; then
+      echo "$(date -Is) [WATCHDOG] Outbound still down; bouncing NetworkManager networking off/on"
+      nmcli networking off >/dev/null 2>&1 || true
+      sleep 5
+      nmcli networking on >/dev/null 2>&1 || true
+      sleep 8
+    else
+      echo "$(date -Is) [WATCHDOG] NetworkManager not active; skipping nmcli bounce"
+    fi
+
+    # restart cloudflared again after network bounce
+    systemctl restart cloudflared >/dev/null 2>&1 || true
+    sleep 4
+  fi
+
+  # 3) restart Meadow stack backend
+  echo "$(date -Is) [WATCHDOG] Restarting meadow-kiosk.service"
+  systemctl restart meadow-kiosk.service >/dev/null 2>&1 || true
+
+  # You asked for this (service can take a bit)
+  sleep 10
+
+  # 4) force kiosk UI
+  if [ -x "$ENTER_KIOSK" ]; then
+    echo "$(date -Is) [WATCHDOG] Entering kiosk UI via enter-kiosk.sh"
+    sudo -u meadow bash "$ENTER_KIOSK" >/dev/null 2>&1 || true
+  else
+    echo "$(date -Is) [WATCHDOG] WARNING: enter-kiosk.sh not executable at $ENTER_KIOSK"
+  fi
+}
+
 while true; do
+  # -----------------------------
+  # Network check (runs regardless of Chromium state)
+  # -----------------------------
+  if has_outbound; then
+    NET_FAILS=0
+  else
+    NET_FAILS=$((NET_FAILS + 1))
+    echo "$(date -Is) [WATCHDOG] outbound check failed (${NET_FAILS}/${NET_FAIL_LIMIT})"
+
+    if [ "$NET_FAILS" -ge "$NET_FAIL_LIMIT" ] && net_cooldown_ok; then
+      NET_FAILS=0
+      recover_network
+      # small chill to avoid immediate re-trigger
+      sleep 5
+    fi
+  fi
+
   # Only act if kiosk Chromium is actually running
   if ! pgrep -f "chromium.*--kiosk" >/dev/null; then
     RING=(); IDX=0; FILLED=0
