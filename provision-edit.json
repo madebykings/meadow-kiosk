@@ -1,5 +1,23 @@
 {
   "kiosk_token": "UNIT-0001-SPARTAN",
   "domain": "https://meadowvending.com",
-  "provision_key": "MASTER-PROVISION-KEY"
+  "provision_key": "MASTER-PROVISION-KEY",
+
+  "network": {
+    "enable_4g": true,
+
+    "sim_provider": "asda",
+
+    "apn": "",
+    "apn_fallbacks": [
+      "internet",
+      "everywhere",
+      "payg.internet"
+    ],
+
+    "lte_only": true,
+    "conn_name": "meadow-4g",
+
+    "cloudflared_restart_always": true
+  }
 }
