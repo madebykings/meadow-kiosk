@@ -6,8 +6,6 @@
   "network": {
     "enable_4g": true,
 
-    "sim_provider": "asda",
-
     "apn": "",
     "apn_fallbacks": [
       "internet",
@@ -16,8 +14,18 @@
     ],
 
     "lte_only": true,
-    "conn_name": "meadow-4g",
+    "conn_name": "meadow-4g"
+  },
 
-    "cloudflared_restart_always": true
+  "cloudflared": {
+    "enable": true,
+    "install": true,
+
+    "hostname": "kiosk1.meadowvending.com",
+
+    "tunnel_token": "",
+
+    "service_name": "meadow-cloudflared",
+    "restart_always": true
   }
 }
