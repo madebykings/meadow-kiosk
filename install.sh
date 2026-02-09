@@ -13,8 +13,6 @@ sudo apt update
 sudo apt upgrade -y
 
 echo "=== Installing system dependencies ==="
-# NOTE: rsync is required because we use it to sync the repo into TARGET_DIR
-# NOTE: rpi-eeprom provides rpi-eeprom-config (EEPROM check guidance)
 sudo apt install -y \
   git \
   rsync \
@@ -33,11 +31,11 @@ sudo apt install -y \
   modemmanager \
   network-manager \
   usb-modeswitch \
-  grim
+  grim \
+  curl \
+  ca-certificates
 
 echo "=== Pi 5 EEPROM auto-boot sanity check (WAIT_FOR_POWER_BUTTON / POWER_OFF_ON_HALT) ==="
-# Do NOT auto-edit EEPROM in an installer (interactive + can brick if mis-edited).
-# Just detect + print the fix command.
 if command -v rpi-eeprom-config >/dev/null 2>&1; then
   EEPROM_CFG="$(sudo -E rpi-eeprom-config 2>/dev/null || true)"
   WAIT_VAL="$(echo "${EEPROM_CFG}" | grep -E '^\s*WAIT_FOR_POWER_BUTTON=' | tail -n 1 | cut -d= -f2 | tr -d '[:space:]' || true)"
@@ -88,7 +86,6 @@ sudo mkdir -p "${TARGET_DIR}"
 sudo chown -R "${MEADOW_USER}:${MEADOW_GROUP}" "${TARGET_DIR}"
 
 # If the install script is being run from somewhere else, sync the repo contents into TARGET_DIR.
-# This avoids the old pattern of copying single files into /home/meadow/.
 if [ "${SCRIPT_DIR}" != "${TARGET_DIR}" ]; then
   echo "=== Syncing repo into ${TARGET_DIR} (from ${SCRIPT_DIR}) ==="
   sudo rsync -a --delete --exclude '.git' "${SCRIPT_DIR}/" "${TARGET_DIR}/"
@@ -97,14 +94,10 @@ else
   echo "=== Running from ${TARGET_DIR} (no repo sync needed) ==="
 fi
 
-# ------------------------------------------------------------
-# Provisioned networking (4G/APN) driven by provision.json
-# ------------------------------------------------------------
-echo "=== Network provisioning (4G/APN) ==="
 PROVISION_JSON="${TARGET_DIR}/provision.json"
 
 json_get() {
-  # Usage: json_get ".network.apn"  (prints scalar or JSON for lists/dicts)
+  # Usage: json_get ".network.apn"
   local path="$1"
   if [ -f "$PROVISION_JSON" ]; then
     python3 - "$path" <<PY 2>/dev/null || true
@@ -148,6 +141,16 @@ PY
   fi
 }
 
+truthy() {
+  case "${1:-}" in
+    1|true|True|TRUE|yes|Yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ------------------------------------------------------------
+# 4G setup (NetworkManager + ModemManager) driven by provision.json
+# ------------------------------------------------------------
 ensure_nm_mm() {
   sudo systemctl enable NetworkManager ModemManager >/dev/null 2>&1 || true
   sudo systemctl restart NetworkManager ModemManager >/dev/null 2>&1 || true
@@ -156,14 +159,14 @@ ensure_nm_mm() {
 setup_4g_from_provision() {
   local enable
   enable="$(json_get ".network.enable_4g")"
-  if [ "$enable" != "True" ] && [ "$enable" != "true" ] && [ "$enable" != "1" ]; then
+  if ! truthy "$enable"; then
     echo "[4G] provision.json: network.enable_4g not true; skipping 4G setup"
     return 0
   fi
 
   ensure_nm_mm
 
-  # Try to wait briefly for wwan0 to appear (non-fatal if slow)
+  # Wait briefly for wwan0 to appear (best-effort)
   for _ in $(seq 1 15); do
     nmcli -t -f DEVICE,TYPE dev status 2>/dev/null | grep -q '^wwan0:gsm' && break
     sleep 1
@@ -176,7 +179,7 @@ setup_4g_from_provision() {
   apn="$(json_get ".network.apn")"
   lte_only="$(json_get ".network.lte_only")"
 
-  # Build APN candidates: explicit apn + apn_fallbacks + last-resort defaults
+  # Candidates: explicit apn + apn_fallbacks + defaults
   local candidates=""
   if [ -n "$apn" ] && [ "$apn" != "null" ]; then
     candidates="$apn"
@@ -210,11 +213,11 @@ PY
     sudo nmcli con add type gsm ifname "*" con-name "$conn_name" apn "$first_apn" >/dev/null
   fi
 
-  # Make it stable
+  # Make stable
   sudo nmcli con modify "$conn_name" connection.autoconnect yes >/dev/null || true
   sudo nmcli con modify "$conn_name" ipv4.method auto >/dev/null || true
 
-  if [ "$lte_only" = "True" ] || [ "$lte_only" = "true" ] || [ "$lte_only" = "1" ]; then
+  if truthy "$lte_only"; then
     sudo nmcli con modify "$conn_name" gsm.network-type lte >/dev/null || true
   fi
 
@@ -229,20 +232,102 @@ PY
     fi
   done
 
-  echo "[4G] ERROR: failed to connect using APNs: $candidates" >&2
-  return 1
+  echo "[4G] WARNING: failed to connect using APNs: $candidates (install continues)" >&2
+  return 0
 }
 
-harden_cloudflared() {
-  local want
-  want="$(json_get ".network.cloudflared_restart_always")"
-  if [ "$want" != "True" ] && [ "$want" != "true" ] && [ "$want" != "1" ]; then
-    echo "[cloudflared] restart policy not requested; skipping"
+# ------------------------------------------------------------
+# cloudflared install + token service driven by provision.json
+# ------------------------------------------------------------
+install_cloudflared() {
+  local install enable
+  install="$(json_get ".cloudflared.install")"
+  enable="$(json_get ".cloudflared.enable")"
+
+  if ! truthy "$install" && ! truthy "$enable"; then
+    echo "[cloudflared] disabled by provision.json (install+enable false); skipping install"
     return 0
   fi
 
+  if command -v cloudflared >/dev/null 2>&1; then
+    echo "[cloudflared] Already installed: $(cloudflared --version 2>/dev/null || true)"
+    return 0
+  fi
+
+  echo "[cloudflared] Installing via Cloudflare apt repo"
+  sudo mkdir -p /usr/share/keyrings
+
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+    | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
+    | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
+
+  sudo apt update
+  sudo apt install -y cloudflared
+
+  echo "[cloudflared] Installed: $(cloudflared --version 2>/dev/null || true)"
+}
+
+setup_cloudflared_token_service() {
+  local enable token hostname service_name
+  enable="$(json_get ".cloudflared.enable")"
+  if ! truthy "$enable"; then
+    echo "[cloudflared] enable is false; skipping service setup"
+    return 0
+  fi
+
+  token="$(json_get ".cloudflared.tunnel_token")"
+  hostname="$(json_get ".cloudflared.hostname")"
+  service_name="$(json_get ".cloudflared.service_name")"
+  [ -n "$service_name" ] && [ "$service_name" != "null" ] || service_name="meadow-cloudflared"
+
+  if [ -z "${token:-}" ] || [ "$token" = "null" ]; then
+    echo "[cloudflared] No tunnel_token set. Installed/hardened only."
+    if [ -n "${hostname:-}" ] && [ "$hostname" != "null" ]; then
+      echo "[cloudflared] Hostname is set to: ${hostname} (you still need to map it to a tunnel in Cloudflare)"
+    fi
+    return 0
+  fi
+
+  echo "[cloudflared] Writing ${service_name}.service (token-based)"
+  sudo tee "/etc/systemd/system/${service_name}.service" >/dev/null <<EOF
+[Unit]
+Description=Meadow Cloudflare Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token ${token}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable "${service_name}.service"
+  sudo systemctl restart "${service_name}.service" || true
+
+  if [ -n "${hostname:-}" ] && [ "$hostname" != "null" ]; then
+    echo "[cloudflared] Hostname in provision.json: ${hostname}"
+    echo "[cloudflared] NOTE: DNS routing should already exist in Cloudflare unless you add API automation later."
+  fi
+}
+
+harden_cloudflared_restart() {
+  local want
+  want="$(json_get ".cloudflared.restart_always")"
+  if ! truthy "$want"; then
+    echo "[cloudflared] restart_always not requested; skipping hardening"
+    return 0
+  fi
+
+  # Harden stock cloudflared.service too if it exists on older images
   if systemctl list-unit-files | grep -q '^cloudflared\.service'; then
-    echo "[cloudflared] Applying Restart=always drop-in"
+    echo "[cloudflared] Applying Restart=always drop-in for cloudflared.service"
     sudo mkdir -p /etc/systemd/system/cloudflared.service.d
     cat <<'EOF' | sudo tee /etc/systemd/system/cloudflared.service.d/restart.conf >/dev/null
 [Service]
@@ -251,14 +336,14 @@ RestartSec=5
 EOF
     sudo systemctl daemon-reload
     sudo systemctl restart cloudflared || true
-  else
-    echo "[cloudflared] cloudflared.service not found; skipping"
   fi
 }
 
-# Best-effort (don’t fail install if a SIM isn’t inserted yet)
+# Run provisioning steps (best-effort; do not fail install if SIM/token not present yet)
 setup_4g_from_provision || true
-harden_cloudflared || true
+install_cloudflared || true
+setup_cloudflared_token_service || true
+harden_cloudflared_restart || true
 
 echo "=== Install python deps (best-effort) ==="
 if [ -f "${TARGET_DIR}/requirements.txt" ]; then
@@ -270,19 +355,15 @@ else
 fi
 
 echo "=== Kill any stray kiosk processes (belt + braces) ==="
-# New canonical paths
 sudo pkill -f "${TARGET_DIR}/kiosk-browser\.sh" 2>/dev/null || true
 sudo pkill -f "kiosk-browser\.sh" 2>/dev/null || true
 sudo pkill -f "chromium.*--kiosk" 2>/dev/null || true
 sudo pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true
-# Also kill legacy paths if they exist (from older installs)
 sudo pkill -f "/home/meadow/kiosk-browser\.sh" 2>/dev/null || true
 
 echo "=== Ensure runtime + state directories ==="
-# Runtime dir used by kiosk-browser.sh (preferred)
 sudo mkdir -p /run/meadow
 sudo chown "${MEADOW_USER}:${MEADOW_GROUP}" /run/meadow
-# State dir lives inside the repo (single source of truth)
 sudo mkdir -p "${TARGET_DIR}/state"
 sudo chown -R "${MEADOW_USER}:${MEADOW_GROUP}" "${TARGET_DIR}/state"
 
@@ -294,13 +375,10 @@ sudo chmod 755 \
   "${TARGET_DIR}/update-meadow.sh" \
   "${TARGET_DIR}/kiosk-freeze-watchdog.sh" \
   2>/dev/null || true
-# offline.html should be readable
 sudo chmod 644 "${TARGET_DIR}/offline.html" 2>/dev/null || true
 sudo chown -R "${MEADOW_USER}:${MEADOW_GROUP}" "${TARGET_DIR}"
 
 echo "=== Install enter/exit wrappers (canonical) ==="
-# Overwrite enter-kiosk.sh + exit-kiosk.sh with known-good versions that use canonical paths.
-# (This avoids any drift from older installs.)
 cat <<'EOF' | sudo tee "${TARGET_DIR}/enter-kiosk.sh" >/dev/null
 #!/bin/bash
 set -euo pipefail
@@ -313,7 +391,6 @@ STATE_DIR="${ROOT}/state"
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
-# Normalize URL to avoid redirect churn
 URL="https://meadowvending.com/kiosk1/"
 if [ -f "$URL_FILE" ]; then
   CANDIDATE="$(head -n 1 "$URL_FILE" | tr -d '\r\n' || true)"
@@ -326,19 +403,15 @@ if [ "$URL" = "https://meadowvending.com/kiosk1" ]; then
 fi
 echo "$URL" > "$URL_FILE"
 
-# Ensure /run/meadow exists
 mkdir -p /run/meadow 2>/dev/null || true
 chown meadow:meadow /run/meadow 2>/dev/null || true
 
-# Make "Enter" behave like the proven-good sequence: exit then enter
 bash "${ROOT}/exit-kiosk.sh" >/dev/null 2>&1 || true
 sleep 0.4
 
-# Clear stop flags so kiosk loop can run
 rm -f "$STOP_FLAG_RUN" 2>/dev/null || true
 rm -f "$STOP_FLAG_TMP" 2>/dev/null || true
 
-# Display env (important when launched via systemd / API)
 export DISPLAY=":0"
 export XAUTHORITY="/home/meadow/.Xauthority"
 export XDG_RUNTIME_DIR="/run/user/1000"
@@ -358,11 +431,9 @@ STOP_FLAG_TMP="/tmp/meadow_kiosk_stop"
 mkdir -p /run/meadow 2>/dev/null || true
 chown meadow:meadow /run/meadow 2>/dev/null || true
 
-# Ask kiosk loop to stop
 date -Is 2>/dev/null > "$STOP_FLAG_RUN" || true
 touch "$STOP_FLAG_TMP" 2>/dev/null || true
 
-# Kill kiosk loop + chromium kiosk (best-effort)
 pkill -f "${ROOT}/kiosk-browser\.sh" 2>/dev/null || true
 pkill -f "kiosk-browser\.sh" 2>/dev/null || true
 pkill -f "chromium-browser.*--kiosk" 2>/dev/null || true
@@ -396,13 +467,9 @@ Exec=/usr/bin/xbindkeys -f /home/meadow/.xbindkeysrc
 X-GNOME-Autostart-enabled=true
 EOF
 
-# ------------------------------------------------------------
-# labwc: hide cursor for touchscreen kiosk (Wayland-safe)
-# ------------------------------------------------------------
-echo "=== labwc: hide cursor ==="
+echo "=== labwc: hide cursor (Wayland-safe) ==="
 LABWC_DIR="/home/meadow/.config/labwc"
 LABWC_RC="${LABWC_DIR}/rc.xml"
-
 sudo -u "${MEADOW_USER}" mkdir -p "${LABWC_DIR}"
 
 if [ ! -f "${LABWC_RC}" ]; then
@@ -416,23 +483,16 @@ if [ ! -f "${LABWC_RC}" ]; then
 </labwc_config>
 EOF
 else
-  # Ensure hideCursor + hideCursorDelay exist and are set correctly (idempotent)
   if grep -q "<hideCursor>" "${LABWC_RC}"; then
-    sudo sed -i 's#<hideCursor>.*</hideCursor>#<hideCursor>true</hideCursor>#' "${LABWC_RC}"
-  else
-    sudo sed -i 's#</core>#  <hideCursor>true</hideCursor>\n    <hideCursorDelay>0</hideCursorDelay>\n  </core>#' "${LABWC_RC}" 2>/dev/null || true
+    sudo sed -i 's#<hideCursor>.*</hideCursor>#<hideCursor>true</hideCursor>#' "${LABWC_RC}" || true
   fi
-
   if grep -q "<hideCursorDelay>" "${LABWC_RC}"; then
-    sudo sed -i 's#<hideCursorDelay>.*</hideCursorDelay>#<hideCursorDelay>0</hideCursorDelay>#' "${LABWC_RC}"
+    sudo sed -i 's#<hideCursorDelay>.*</hideCursorDelay>#<hideCursorDelay>0</hideCursorDelay>#' "${LABWC_RC}" || true
   fi
-
-  # If there is no <core> block at all, insert one before </labwc_config>
   if ! grep -q "<core>" "${LABWC_RC}"; then
-    sudo sed -i 's#</labwc_config>#  <core>\n    <hideCursor>true</hideCursor>\n    <hideCursorDelay>0</hideCursorDelay>\n  </core>\n</labwc_config>#' "${LABWC_RC}"
+    sudo sed -i 's#</labwc_config>#  <core>\n    <hideCursor>true</hideCursor>\n    <hideCursorDelay>0</hideCursorDelay>\n  </core>\n</labwc_config>#' "${LABWC_RC}" || true
   fi
 fi
-
 sudo chown -R "${MEADOW_USER}:${MEADOW_GROUP}" "${LABWC_DIR}"
 
 echo "=== Install systemd service (Pi API) ==="
